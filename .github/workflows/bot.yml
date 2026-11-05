@@ -15,22 +15,20 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main
+
+      - name: free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h /
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: cache state
-        uses: actions/cache@v4
-        with:
-          path: data
-          key: state-${{ github.run_id }}
-          restore-keys: state-
 
       - name: deps
         run: |
@@ -42,14 +40,21 @@ jobs:
       - name: run
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: python bot.py
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          ( while true; do
+              sleep 600
+              git add -A data .keepalive 2>/dev/null || true
+              git commit -qm "state" || true
+              git push -q origin HEAD:main || true
+            done ) &
+          python bot.py
 
       - name: keepalive
         if: always()
         run: |
           date > .keepalive
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add .keepalive
+          git add -A .keepalive data 2>/dev/null || true
           git commit -m "keepalive" || true
           git push origin HEAD:main || true
