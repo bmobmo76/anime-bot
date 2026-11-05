@@ -30,17 +30,20 @@ def http_get(url, ref=None, **kw):
     ck = _cookie_header(url)
     if ck:
         h["Cookie"] = ck
-    return creq.get(url, headers=h, impersonate="chrome", timeout=45,
-                    allow_redirects=True, **kw)
+    kw.setdefault("timeout", 45)
+    kw.setdefault("allow_redirects", True)
+    kw.setdefault("impersonate", "chrome")
+    return creq.get(url, headers=h, **kw)
 
 
-def http_post(url, data, ref=None):
+def http_post(url, data, ref=None, **kw):
     h = _headers(ref)
     ck = _cookie_header(url)
     if ck:
         h["Cookie"] = ck
-    return creq.post(url, headers=h, data=data, impersonate="chrome", timeout=45)
-
+    kw.setdefault("timeout", 45)
+    kw.setdefault("impersonate", "chrome")
+    return creq.post(url, headers=h, data=data, **kw)
 
 def origin(url):
     p = urllib.parse.urlsplit(url)
@@ -508,7 +511,7 @@ async def health():
             try:
                 return http_get(base, timeout=25).status_code
             except Exception as e:
-                return f"خطا {type(e).__name__}"
+                return f"{type(e).__name__}: {str(e)[:120]}"
         code = await asyncio.to_thread(probe)
         if code in (403, 503):
             await warm(site.base)
