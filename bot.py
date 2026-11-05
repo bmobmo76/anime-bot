@@ -1,4 +1,4 @@
-import asyncio, json, os, pathlib, time
+import asyncio, json, os, pathlib, shutil, time, traceback
 import httpx
 import engine
 
@@ -6,6 +6,7 @@ TOKEN = os.environ["BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 RUN_SECONDS = 5.4 * 3600
 START = time.time()
+LAST_ERROR = "بدون خطا"
 
 DATA = pathlib.Path("data")
 DATA.mkdir(exist_ok=True)
@@ -19,12 +20,16 @@ if STATE_F.exists():
         pass
 
 def save():
-    STATE_F.write_text(json.dumps(state))
+    try:
+        STATE_F.write_text(json.dumps(state))
+    except Exception:
+        pass
 
 def new_job(chat_id, payload):
     state["seq"] += 1
     jid = str(state["seq"])
     payload["chat_id"] = chat_id
+    payload["jid"] = jid
     state["jobs"][jid] = payload
     save()
     return jid
@@ -33,8 +38,7 @@ client = httpx.AsyncClient(timeout=60)
 
 async def api(method, files=None, **params):
     try:
-        r = await client.post(f"{API}/{method}", data=params, files=files,
-                              timeout=300)
+        r = await client.post(f"{API}/{method}", data=params, files=files, timeout=300)
         return r.json()
     except Exception as e:
         return {"ok": False, "desc": str(e)}
@@ -60,8 +64,7 @@ async def send_video(chat_id, path, caption):
 async def send_doc(chat_id, path, caption):
     with open(path, "rb") as f:
         files = {"document": (os.path.basename(path), f, "text/plain")}
-        return await api("sendDocument", files=files, chat_id=chat_id,
-                         caption=caption)
+        return await api("sendDocument", files=files, chat_id=chat_id, caption=caption)
 
 
 HELP = ("اسم انیمه را بفرست.\n"
@@ -82,7 +85,13 @@ async def handle_message(msg):
     if text.startswith("/status"):
         up = int(time.time() - START)
         await send(chat_id, f"فعال. زمان اجرا: {up // 60} دقیقه.\n"
-                            f"کارهای در انتظار: {len(state['jobs'])}")
+                            f"کارهای در انتظار: {len(state['jobs'])}\n"
+                            f"آخرین خطا: {LAST_ERROR}")
+        return
+    if text.startswith("/debug"):
+        await send(chat_id, "بررسی دسترسی به سایت‌ها...")
+        report = await engine.health()
+        await send(chat_id, report)
         return
     if text.startswith("/"):
         return
@@ -90,7 +99,7 @@ async def handle_message(msg):
     await send(chat_id, f"🔎 جستجوی «{text}» در ۵ سایت...")
     results = await engine.search_all(text)
     if not results:
-        await send(chat_id, "چیزی پیدا نشد. املای اسم را عوض کن یا نام انگلیسی بفرست.")
+        await send(chat_id, "چیزی پیدا نشد. نام انگلیسی را امتحان کن.")
         return
 
     jid = new_job(chat_id, {"type": "anime", "results": results})
@@ -181,40 +190,46 @@ async def show_page(chat_id, mid, jid, page):
         nav.append({"text": "▶️", "callback_data": f"p|{jid}|{page + 1}"})
     if nav:
         rows.append(nav)
-    await edit(chat_id, mid,
-               f"{job['title']} — {job['kind']}\nقسمت را انتخاب کن:", rows)
+    await edit(chat_id, mid, f"{job['title']} — {job['kind']}\nقسمت را انتخاب کن:", rows)
 
 
 sem = asyncio.Semaphore(2)
 
 async def run_job(job, num, height):
+    global LAST_ERROR
     async with sem:
         chat_id = job["chat_id"]
         ep = next((e for e in job["episodes"] if e["num"] == num), None)
         if not ep:
             await send(chat_id, "قسمت پیدا نشد.")
             return
+
+        tmpdir = f"/tmp/dl/{job['jid']}-{num}"
+        loop = asyncio.get_running_loop()
+
         try:
             url = await engine.resolve(job["site"], ep, job["kind"])
         except Exception as e:
             url = None
+            LAST_ERROR = f"resolve: {e}"
             await send(chat_id, f"خطا در استخراج لینک: {e}")
         if not url:
             await send(chat_id, "لینک این قسمت درنیامد (احتمالاً سرور دوبله ندارد "
                                 "یا ساختار سایت عوض شده).")
             return
 
-        loop = asyncio.get_running_loop()
         try:
             video, subs = await loop.run_in_executor(
-                None, engine.download, url, ep["url"], job["kind"], height)
+                None, engine.download, url, ep["url"], job["kind"], height, tmpdir)
         except Exception as e:
+            LAST_ERROR = f"download: {str(e)[:200]}"
             await send(chat_id, f"❌ دانلود نشد:\n{str(e)[:300]}")
             return
 
         try:
             parts = await loop.run_in_executor(None, engine.split, video)
         except Exception as e:
+            LAST_ERROR = f"split: {e}"
             await send(chat_id, f"❌ تقسیم فایل نشد: {e}")
             return
 
@@ -231,18 +246,21 @@ async def run_job(job, num, height):
             await send_doc(chat_id, subs, "زیرنویس انگلیسی")
 
         engine.cleanup(video, subs, *parts)
-        state["jobs"].pop(next((k for k, v in state["jobs"].items() if v is job), ""), None)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        state["jobs"].pop(job["jid"], None)
         save()
 
 
 async def handle_update(u):
+    global LAST_ERROR
     try:
         if "message" in u:
             await handle_message(u["message"])
         elif "callback_query" in u:
             await handle_callback(u["callback_query"])
     except Exception as e:
-        print("handler error:", e)
+        LAST_ERROR = f"handler: {e}"
+        print(traceback.format_exc())
 
 
 async def poll():
@@ -265,9 +283,12 @@ async def poll():
 
 
 async def main():
-    await send_ok = await api("getMe")
-    print(send_ok)
+    print(await api("getMe"))
     await poll()
     await client.aclose()
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except Exception:
+    traceback.print_exc()
+    raise SystemExit(1)
