@@ -365,3 +365,17 @@ def cleanup(*paths):
                 os.remove(p)
         except Exception:
             pass
+async def health():
+    lines = []
+    for key, site in SITES.items():
+        def probe(base=site.base):
+            try:
+                r = http_get(base, timeout=25)
+                return r.status_code
+            except Exception as e:
+                return f"خطا {type(e).__name__}"
+        code = await asyncio.to_thread(probe)
+        mark = "✅" if code == 200 else "❌"
+        lines.append(f"{mark} {site.name}: {code}")
+    return "\n".join(lines)
+      
