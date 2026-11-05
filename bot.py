@@ -12,7 +12,7 @@ DATA = pathlib.Path("data")
 DATA.mkdir(exist_ok=True)
 STATE_F = DATA / "state.json"
 
-state = {"offset": 0, "jobs": {}, "seq": 0}
+state = {"offset": 0, "jobs": {}, "seq": 0, "set": {}, "cancel": []}
 if STATE_F.exists():
     try:
         state.update(json.loads(STATE_F.read_text()))
@@ -25,11 +25,16 @@ def save():
     except Exception:
         pass
 
+def cfg(chat_id):
+    c = state["set"].setdefault(str(chat_id), {})
+    c.setdefault("q", 720)
+    c.setdefault("m", "video")
+    return c
+
 def new_job(chat_id, payload):
     state["seq"] += 1
     jid = str(state["seq"])
-    payload["chat_id"] = chat_id
-    payload["jid"] = jid
+    payload.update(chat_id=chat_id, jid=jid)
     state["jobs"][jid] = payload
     save()
     return jid
@@ -54,13 +59,13 @@ async def edit(chat_id, mid, text, kb=None):
     if kb:
         p["reply_markup"] = json.dumps({"inline_keyboard": kb})
     r = await api("editMessageText", **p)
-    if not r.get("ok"):
-        return await send(chat_id, text, kb)
-    return r
+    return r if r.get("ok") else await send(chat_id, text, kb)
 
-async def send_video(chat_id, path, caption):
+async def send_video(chat_id, path, caption, th=None):
     with open(path, "rb") as f:
         files = {"video": (os.path.basename(path), f, "video/mp4")}
+        if th and os.path.exists(th):
+            files["thumbnail"] = ("t.jpg", open(th, "rb"), "image/jpeg")
         return await api("sendVideo", files=files, chat_id=chat_id,
                          caption=caption, supports_streaming="true")
 
@@ -69,16 +74,27 @@ async def send_doc(chat_id, path, caption):
         files = {"document": (os.path.basename(path), f, "application/octet-stream")}
         return await api("sendDocument", files=files, chat_id=chat_id, caption=caption)
 
-async def deliver(chat_id, path, caption):
-    r = await send_video(chat_id, path, caption)
+async def deliver(chat_id, path, caption, mode, th=None):
+    if mode == "doc":
+        return await send_doc(chat_id, path, caption)
+    r = await send_video(chat_id, path, caption, th)
     if not r.get("ok"):
         r = await send_doc(chat_id, path, caption)
     return r
 
-
 HELP = ("اسم انگلیسی انیمه را بفرست.\n"
-        "بعد از دکمه‌ها سایت، نوع (زیرنویس/دوبله)، قسمت و کیفیت را انتخاب کن.\n"
-        "فایل به بخش‌های ~۴۰ مگابایتی تقسیم و ارسال می‌شود.")
+        "بعد سایت، نسخه (زیرنویس/دوبله) و قسمت را انتخاب کن.\n"
+        "می‌توانی یک قسمت، یک بازه یا همهٔ قسمت‌ها را بگیری.\n\n"
+        "/settings کیفیت و نوع ارسال\n/queue کارهای جاری\n/cancel لغو")
+
+def menu_kb():
+    return [
+        [{"text": "۴۸۰p", "callback_data": "s|q|480"},
+         {"text": "۷۲۰p", "callback_data": "s|q|720"},
+         {"text": "۱۰۸۰p", "callback_data": "s|q|1080"}],
+        [{"text": "ارسال ویدیو", "callback_data": "s|m|video"},
+         {"text": "ارسال فایل", "callback_data": "s|m|doc"}],
+    ]
 
 async def handle_message(msg):
     chat_id = msg["chat"]["id"]
@@ -86,95 +102,142 @@ async def handle_message(msg):
     if not text:
         return
     if text.startswith("/start"):
-        await send(chat_id, "سلام\n" + HELP)
-        return
+        return await send(chat_id, "سلام\n" + HELP)
     if text.startswith("/help"):
-        await send(chat_id, HELP)
-        return
+        return await send(chat_id, HELP)
+    if text.startswith("/settings"):
+        c = cfg(chat_id)
+        return await send(chat_id, f"کیفیت: {c['q']}p\n"
+                                   f"ارسال: {'ویدیو' if c['m'] == 'video' else 'فایل'}",
+                        menu_kb())
     if text.startswith("/status"):
         up = int(time.time() - START)
-        await send(chat_id, f"فعال. زمان اجرا: {up // 60} دقیقه.\n"
-                            f"کارهای در انتظار: {len(state['jobs'])}\n"
-                            f"آخرین خطا: {LAST_ERROR}")
-        return
+        return await send(chat_id, f"فعال. {up // 60} دقیقه.\n"
+                                   f"کارها: {len(state['jobs'])}\n"
+                                   f"دیسک آزاد: {engine.free_gb():.1f}GB\n"
+                                   f"آخرین خطا: {LAST_ERROR}")
+    if text.startswith("/queue"):
+        rows = [[{"text": f"{v['title'][:30]} E{n}",
+                  "callback_data": f"j|{k}"}]
+                for k, v in list(state["jobs"].items())[-10:]
+                for n in [v.get("cur", "-")]]
+        return await send(chat_id, f"{len(state['jobs'])} کار در جریان", rows or None)
+    if text.startswith("/cancel"):
+        state["cancel"].append(str(chat_id))
+        save()
+        return await send(chat_id, "لغو شد. کارهای باقی‌مانده رد می‌شوند.")
     if text.startswith("/debug"):
-        await send(chat_id, "بررسی دسترسی به سایت‌ها...")
-        await send(chat_id, await engine.health())
-        return
+        await send(chat_id, "بررسی سایت‌ها...")
+        return await send(chat_id, await engine.health())
     if text.startswith("/"):
         return
 
-    await send(chat_id, f"جستجوی «{text}» در ۵ سایت...")
-    results = await engine.search_all(text)
-    if not results:
-        await send(chat_id, "چیزی پیدا نشد. نام انگلیسی را امتحان کن.")
-        return
+    await send(chat_id, f"جستجوی «{text}»...")
+    res = await engine.search_all(text)
+    if not res:
+        res = await engine.search_all(text.replace(" ", ""))
+    if not res:
+        return await send(chat_id, "چیزی پیدا نشد. نام انگلیسی یا روماجی را امتحان کن.")
+    jid = new_job(chat_id, {"type": "search", "results": res, "title": text})
+    await show_results(chat_id, None, jid, 0)
 
-    jid = new_job(chat_id, {"type": "anime", "results": results})
-    kb = []
-    for i, r in enumerate(results[:10]):
-        site = engine.SITES[r["site"]].name
-        kb.append([{"text": f"[{site}] {r['title'][:60]}",
-                    "callback_data": f"a|{jid}|{i}"}])
-    await send(chat_id, "کدام را می‌خواهی؟", kb)
-
+async def show_results(chat_id, mid, jid, page):
+    job = state["jobs"].get(jid)
+    if not job:
+        return await edit(chat_id, mid, "منقضی شد.")
+    per = 8
+    chunk = job["results"][page * per:(page + 1) * per]
+    rows = [[{"text": f"[{engine.SITES[r['site']].name}] {r['title'][:52]}",
+              "callback_data": f"a|{jid}|{job['results'].index(r)}"}]
+            for r in chunk]
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀", "callback_data": f"g|{jid}|{page - 1}"})
+    if (page + 1) * per < len(job["results"]):
+        nav.append({"text": "▶", "callback_data": f"g|{jid}|{page + 1}"})
+    if nav:
+        rows.append(nav)
+    await edit(chat_id, mid, f"نتایج ({len(job['results'])}):", rows)
 
 async def handle_callback(cb):
     chat_id = cb["message"]["chat"]["id"]
     mid = cb["message"]["message_id"]
     await api("answerCallbackQuery", callback_query_id=cb["id"])
-    parts = cb["data"].split("|")
-    action = parts[0]
+    p = cb["data"].split("|")
+    a = p[0]
 
-    if action == "a":
-        jid, idx = parts[1], int(parts[2])
-        job = state["jobs"].get(jid)
-        if not job:
-            return await edit(chat_id, mid, "منقضی شد، دوباره جستجو کن.")
-        chosen = job["results"][idx]
-        job.update(site=chosen["site"], anime_url=chosen["url"], title=chosen["title"])
+    if a == "s":
+        c = cfg(chat_id)
+        c[p[1]] = int(p[2]) if p[1] == "q" else p[2]
         save()
-        kb = [[{"text": "زیرنویس انگلیسی", "callback_data": f"d|{jid}|sub"}],
-              [{"text": "دوبله انگلیسی", "callback_data": f"d|{jid}|dub"}]]
-        await edit(chat_id, mid, f"{chosen['title']}\nکدام نسخه؟", kb)
+        return await edit(chat_id, mid,
+                          f"ذخیره شد. کیفیت {c['q']}p / "
+                          f"{'ویدیو' if c['m'] == 'video' else 'فایل'}", menu_kb())
 
-    elif action == "d":
-        jid, kind = parts[1], parts[2]
-        job = state["jobs"].get(jid)
+    if a == "g":
+        return await show_results(chat_id, mid, p[1], int(p[2]))
+
+    if a == "a":
+        job = state["jobs"].get(p[1])
         if not job:
             return await edit(chat_id, mid, "منقضی شد.")
-        await edit(chat_id, mid, "در حال گرفتن لیست قسمت‌ها...")
+        r = job["results"][int(p[2])]
+        job.update(site=r["site"], anime_url=r["url"], title=r["title"])
+        save()
+        await edit(chat_id, mid, "بررسی نسخه‌های موجود...")
         try:
-            eps = await asyncio.to_thread(
-                engine.SITES[job["site"]].episodes, job["anime_url"])
+            eps = await asyncio.to_thread(engine.SITES[r["site"]].episodes, r["url"])
         except Exception as e:
             return await edit(chat_id, mid, f"لیست قسمت‌ها نیامد: {e}")
         if not eps:
             return await edit(chat_id, mid, "قسمتی پیدا نشد.")
-        job.update(kind=kind, episodes=eps)
+        job["episodes"] = eps
         save()
-        await show_page(chat_id, mid, jid, 0)
+        kb = [[{"text": "زیرنویس انگلیسی", "callback_data": f"k|{p[1]}|sub"}],
+              [{"text": "دوبله انگلیسی", "callback_data": f"k|{p[1]}|dub"}]]
+        await edit(chat_id, mid, f"{r['title']}\n{len(eps)} قسمت. کدام نسخه؟", kb)
 
-    elif action == "p":
-        await show_page(chat_id, mid, parts[1], int(parts[2]))
-
-    elif action == "e":
-        jid, num = parts[1], parts[2]
-        job = state["jobs"].get(jid)
+    elif a == "k":
+        job = state["jobs"].get(p[1])
         if not job:
             return await edit(chat_id, mid, "منقضی شد.")
-        kb = [[{"text": "۴۸۰p (سبک‌تر)", "callback_data": f"q|{jid}|{num}|480"},
-               {"text": "۷۲۰p", "callback_data": f"q|{jid}|{num}|720"}]]
-        await edit(chat_id, mid, f"قسمت {num} — کیفیت؟", kb)
+        job["kind"] = p[2]
+        save()
+        await show_page(chat_id, mid, p[1], 0)
 
-    elif action == "q":
-        jid, num, height = parts[1], parts[2], int(parts[3])
-        job = state["jobs"].get(jid)
+    elif a == "p":
+        await show_page(chat_id, mid, p[1], int(p[2]))
+
+    elif a == "e":
+        job = state["jobs"].get(p[1])
         if not job:
             return await edit(chat_id, mid, "منقضی شد.")
-        await edit(chat_id, mid, f"قسمت {num} در حال دانلود...")
-        asyncio.create_task(run_job(job, num, height))
+        n = p[2]
+        kb = [[{"text": "دانلود همین قسمت", "callback_data": f"d|{p[1]}|{n}"}],
+              [{"text": "از این قسمت تا آخر", "callback_data": f"t|{p[1]}|{n}"}],
+              [{"text": "همهٔ قسمت‌ها", "callback_data": f"x|{p[1]}"}]]
+        await edit(chat_id, mid, f"{job['title']} — قسمت {n} ({job['kind']})\nچه چیزی؟", kb)
 
+    elif a in ("d", "t", "x"):
+        job = state["jobs"].get(p[1])
+        if not job:
+            return await edit(chat_id, mid, "منقضی شد.")
+        if a == "d":
+            nums = [p[2]]
+        elif a == "t":
+            alln = [e["num"] for e in job["episodes"]]
+            nums = alln[alln.index(p[2]):]
+        else:
+            nums = [e["num"] for e in job["episodes"]]
+        job["batch"] = nums
+        save()
+        await edit(chat_id, mid, f"شروع {len(nums)} قسمت...")
+        asyncio.create_task(run_batch(job))
+
+    elif a == "j":
+        job = state["jobs"].get(p[1])
+        if job:
+            await edit(chat_id, mid, f"{job['title']} — {job.get('cur', 'در صف')}")
 
 async def show_page(chat_id, mid, jid, page):
     job = state["jobs"].get(jid)
@@ -198,72 +261,83 @@ async def show_page(chat_id, mid, jid, page):
         nav.append({"text": "▶", "callback_data": f"p|{jid}|{page + 1}"})
     if nav:
         rows.append(nav)
-    await edit(chat_id, mid, f"{job['title']} — {job['kind']}\nقسمت را انتخاب کن:", rows)
-
+    await edit(chat_id, mid, f"{job['title']} — {job['kind']}\nقسمت:", rows)
 
 sem = asyncio.Semaphore(2)
 
-async def run_job(job, num, height):
-    global LAST_ERROR
+async def run_batch(job):
+    for n in list(job.get("batch", [])):
+        if str(job["chat_id"]) in state["cancel"]:
+            state["cancel"].remove(str(job["chat_id"]))
+            await send(job["chat_id"], "لغو شد.")
+            break
+        job["cur"] = n
+        save()
+        try:
+            await one_ep(job, n)
+        except Exception as e:
+            LAST_ERROR = f"ep{n}: {str(e)[:150]}"
+            await send(job["chat_id"], f"قسمت {n} نشد:\n{str(e)[:200]}")
+        await asyncio.sleep(1)
+    state["jobs"].pop(job["jid"], None)
+    save()
+    await send(job["chat_id"], "پایان کار.")
+
+async def one_ep(job, num):
     async with sem:
         chat_id = job["chat_id"]
+        c = cfg(chat_id)
         ep = next((e for e in job["episodes"] if e["num"] == num), None)
         if not ep:
-            await send(chat_id, "قسمت پیدا نشد.")
             return
+        if engine.free_gb() < 3:
+            await send(chat_id, "دیسک پر شد؛ پاکسازی می‌کنم.")
+            shutil.rmtree("/tmp/dl", ignore_errors=True)
 
-        tmpdir = f"/tmp/dl/{job['jid']}-{num}"
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        tmp = f"/tmp/dl/{job['jid']}-{num}"
+        shutil.rmtree(tmp, ignore_errors=True)
         loop = asyncio.get_running_loop()
+        msg = await send(chat_id, f"قسمت {num}: گرفتن لینک...")
+        mid = msg.get("result", {}).get("message_id")
 
         try:
-            url = await engine.resolve(job["site"], ep, job["kind"])
-        except Exception as e:
+            url = await engine.resolve(job, ep, job["kind"])
+        except Exception:
             url = None
-            LAST_ERROR = f"resolve: {e}"
         if not url:
-            await send(chat_id, "لینک این قسمت درنیامد (احتمالاً سرور این نسخه "
-                                "وجود ندارد یا ساختار سایت عوض شده).")
+            await edit(chat_id, mid, f"قسمت {num}: لینک درنیامد.")
             return
+
+        def prog(pct):
+            asyncio.run_coroutine_threadsafe(
+                edit(chat_id, mid, f"قسمت {num}: دانلود {pct:.0f}%"), loop)
 
         try:
             video, subs = await loop.run_in_executor(
-                None, engine.download, url, ep["url"], job["kind"], height, tmpdir)
+                None, engine.download, url, ep["url"], job["kind"], c["q"], tmp, prog)
         except Exception as e:
-            LAST_ERROR = f"download: {str(e)[:200]}"
-            await send(chat_id, f"دانلود نشد:\n{str(e)[:300]}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            await edit(chat_id, mid, f"قسمت {num}: دانلود نشد\n{str(e)[:200]}")
+            shutil.rmtree(tmp, ignore_errors=True)
             return
 
-        try:
-            parts = await loop.run_in_executor(None, engine.split, video)
-        except Exception as e:
-            LAST_ERROR = f"split: {e}"
-            await send(chat_id, f"تقسیم فایل نشد: {e}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return
-
+        await edit(chat_id, mid, f"قسمت {num}: پردازش...")
+        video = await loop.run_in_executor(None, engine.mux_subs, video, subs)
+        parts = await loop.run_in_executor(None, engine.split, video)
         if len(parts) > 1:
             engine.cleanup(video)
+        th = await loop.run_in_executor(None, engine.thumb, parts[0], tmp)
 
-        for i, p in enumerate(parts):
-            cap = f"{job['title']} — قسمت {num}"
-            if len(parts) > 1:
-                cap += f" (بخش {i + 1}/{len(parts)})"
-            r = await deliver(chat_id, p, cap)
+        base = f"{job['title']} - E{num} [{c['q']}p]"
+        for i, f in enumerate(parts):
+            cap = base + (f" ({i + 1}/{len(parts)})" if len(parts) > 1 else "")
+            r = await deliver(chat_id, f, cap, c["m"], th)
             if not r.get("ok"):
-                LAST_ERROR = f"upload: {r.get('desc')}"
-                await send(chat_id, f"ارسال بخش {i + 1} نشد: {r.get('desc')}")
-            engine.cleanup(p)
+                await send(chat_id, f"ارسال نشد: {r.get('desc')}")
+            engine.cleanup(f)
             await asyncio.sleep(1)
 
-        if subs:
-            await send_doc(chat_id, subs, "زیرنویس انگلیسی")
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        state["jobs"].pop(job["jid"], None)
-        save()
-
+        shutil.rmtree(tmp, ignore_errors=True)
+        await edit(chat_id, mid, f"قسمت {num}: تمام.")
 
 async def handle_update(u):
     global LAST_ERROR
@@ -275,7 +349,6 @@ async def handle_update(u):
     except Exception as e:
         LAST_ERROR = f"handler: {e}"
         print(traceback.format_exc())
-
 
 async def poll():
     while time.time() - START < RUN_SECONDS:
@@ -293,8 +366,7 @@ async def poll():
             state["offset"] = u["update_id"]
             save()
             asyncio.create_task(handle_update(u))
-    print("پایان چرخه، خروج تمیز")
-
+    print("پایان چرخه")
 
 async def main():
     print(await api("getMe"))
