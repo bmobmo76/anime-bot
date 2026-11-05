@@ -1,0 +1,6 @@
+httpx
+curl_cffi
+beautifulsoup4
+lxml
+playwright
+yt-dlp
