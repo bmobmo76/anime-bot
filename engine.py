@@ -5,6 +5,9 @@ from curl_cffi import requests as creq
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
+_cookies = {}
+
+
 def _headers(ref=None):
     h = {"User-Agent": UA,
          "Accept-Language": "en-US,en;q=0.9",
@@ -13,17 +16,36 @@ def _headers(ref=None):
         h["Referer"] = ref
     return h
 
+
+def _cookie_header(url):
+    host = urllib.parse.urlsplit(url).netloc
+    for base, jar in _cookies.items():
+        if urllib.parse.urlsplit(base).netloc == host and jar:
+            return "; ".join(f"{c['name']}={c['value']}" for c in jar)
+    return None
+
+
 def http_get(url, ref=None, **kw):
-    return creq.get(url, headers=_headers(ref), impersonate="chrome",
-                    timeout=45, allow_redirects=True, **kw)
+    h = _headers(ref)
+    ck = _cookie_header(url)
+    if ck:
+        h["Cookie"] = ck
+    return creq.get(url, headers=h, impersonate="chrome", timeout=45,
+                    allow_redirects=True, **kw)
+
 
 def http_post(url, data, ref=None):
-    return creq.post(url, headers=_headers(ref), data=data,
-                     impersonate="chrome", timeout=45)
+    h = _headers(ref)
+    ck = _cookie_header(url)
+    if ck:
+        h["Cookie"] = ck
+    return creq.post(url, headers=h, data=data, impersonate="chrome", timeout=45)
+
 
 def origin(url):
     p = urllib.parse.urlsplit(url)
     return f"{p.scheme}://{p.netloc}"
+
 
 def _dedup(items, key="url"):
     seen, out = set(), []
@@ -34,7 +56,9 @@ def _dedup(items, key="url"):
         out.append(i)
     return out
 
+
 _browser = None
+
 
 async def _get_browser():
     global _browser
@@ -42,20 +66,86 @@ async def _get_browser():
         from playwright.async_api import async_playwright
         pw = await async_playwright().start()
         _browser = await pw.chromium.launch(
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+                  "--disable-dev-shm-usage"])
     return _browser
 
-async def js_get(url, ref=None, wait=4500):
+
+async def warm(base):
+    """کوکی و clearance را با یک بازدید واقعی می‌گیرد."""
+    try:
+        b = await _get_browser()
+        ctx = await b.new_context(user_agent=UA, locale="en-US")
+        page = await ctx.new_page()
+        try:
+            await page.goto(base, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(4000)
+            _cookies[base] = await ctx.cookies()
+        finally:
+            await ctx.close()
+    except Exception:
+        _cookies[base] = []
+
+
+async def warm_all():
+    await asyncio.gather(*[warm(s.base) for s in SITES.values()])
+
+
+async def js_capture(url, ref=None, wait_ms=9000):
+    """صفحه را باز می‌کند، دکمه پخش را می‌زند و درخواست‌های شبکه را شنود می‌کند."""
     b = await _get_browser()
     hdr = {"Referer": ref} if ref else {}
-    ctx = await b.new_context(user_agent=UA, locale="en-US", extra_http_headers=hdr)
+    ctx = await b.new_context(user_agent=UA, locale="en-US",
+                              extra_http_headers=hdr)
+    found = []
     page = await ctx.new_page()
+
+    def on_req(req):
+        u = req.url
+        if ".m3u8" in u or ".mp4" in u:
+            found.append(u)
+
+    page.on("request", on_req)
+    html = ""
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(wait)
-        return await page.content()
+        try:
+            await page.evaluate(
+                "() => { for (const s of document.querySelectorAll("
+                "'video,button,.play,.vjs-big-play-button,.jw-icon-display,"
+                "'[class*=play]')) { try { s.click(); } catch(e){} } }")
+        except Exception:
+            pass
+        step = 500
+        for _ in range(int(wait_ms / step)):
+            if found:
+                break
+            await page.wait_for_timeout(step)
+        html = await page.content()
     finally:
         await ctx.close()
+
+    for m in re.findall(r'https?://[^"\'\\\s]+?\.(?:m3u8|mp4)[^"\'\\\s]*', html):
+        found.append(m.replace("\\/", "/"))
+    for m in re.findall(r'"file"\s*:\s*"([^"]+)"', html):
+        u = m.replace("\\/", "/")
+        if u.startswith("//"):
+            u = "https:" + u
+        if ".m3u8" in u or ".mp4" in u:
+            found.append(u)
+    return _dedup(found, key=None) if False else list(dict.fromkeys(found))
+
+
+def _best(urls):
+    if not urls:
+        return None
+    m3u8 = [u for u in urls if ".m3u8" in u]
+    for u in m3u8:
+        if "master" in u.lower():
+            return u
+    if m3u8:
+        return m3u8[0]
+    return urls[0]
 
 
 class Site:
@@ -100,7 +190,8 @@ class KaiStyle(Site):
         soup = BeautifulSoup(r.text, "lxml")
         out = []
         for a in soup.select("a[data-id]"):
-            num = a.get("data-num") or a.get_text(strip=True)
+            num = (a.get("data-number") or a.get("data-num")
+                   or a.get_text(strip=True))
             out.append({"num": str(num), "id": a["data-id"], "url": url})
         return out
 
@@ -138,7 +229,7 @@ class WCO(Site):
             out = []
             for a in soup.select("a[href]"):
                 href = a["href"]
-                if "episode" in href or href.count("/") > 3:
+                if "episode" in href or href.count("/") > 4:
                     continue
                 title = a.get("title") or a.get_text(" ", strip=True)
                 if len(title) < 3:
@@ -171,9 +262,10 @@ class WCO(Site):
         r = http_post(self.base + "/inc/embed/getvidlink.php",
                       {"data": m.group(1)}, ref=ep_url)
         try:
-            return r.json().get("file")
+            j = r.json()
         except Exception:
             return None
+        return j.get("file") or j.get("url")
 
 
 class GenericSite(Site):
@@ -218,20 +310,31 @@ class GenericSite(Site):
 
 SITES = {}
 
+
 def _register(cls):
     s = cls()
     SITES[s.key] = s
 
+
 class AniKoto(KaiStyle):
     key, name, base = "anikoto", "AniKoto", "https://anikoto.tv"
+
+
 class AniWave(KaiStyle):
     key, name, base = "aniwave", "AniWave", "https://aniwave.ru"
+
+
 class WcoDub(WCO):
     key, name, base = "wcodub", "WCO (Dub)", "https://wcoanimedub.tv"
+
+
 class WcoSub(WCO):
     key, name, base = "wcosub", "WCO (Sub)", "https://wcoanimesub.tv"
+
+
 class Isekai(GenericSite):
     key, name, base = "isekai", "Isekai2nd", "https://isekai2nd.com"
+
 
 for c in (AniKoto, AniWave, WcoDub, WcoSub, Isekai):
     _register(c)
@@ -239,10 +342,13 @@ for c in (AniKoto, AniWave, WcoDub, WcoSub, Isekai):
 
 async def search_all(query):
     async def one(site):
-        try:
-            return await asyncio.to_thread(site.search, query)
-        except Exception:
-            return []
+        for attempt in range(2):
+            try:
+                return await asyncio.to_thread(site.search, query)
+            except Exception:
+                if attempt == 0:
+                    await warm(site.base)
+        return []
     chunks = await asyncio.gather(*[one(s) for s in SITES.values()])
     flat = [x for c in chunks for x in c]
     flat.sort(key=lambda x: len(x["title"]))
@@ -255,53 +361,67 @@ async def generic_resolve(url, ref=None, depth=0, seen=None):
         return None
     seen.add(url)
     try:
-        html = await js_get(url, ref)
+        found = await js_capture(url, ref)
     except Exception:
-        try:
-            html = await asyncio.to_thread(lambda: http_get(url, ref).text)
-        except Exception:
-            return None
-
-    m = re.search(r'https?://[^"\'\\\s]+?\.m3u8[^"\'\\\s]*', html)
-    if m:
-        return m.group(0).replace("\\/", "/")
-    m = re.search(r'https?://[^"\'\\\s]+?\.mp4[^"\'\\\s]*', html)
-    if m:
-        return m.group(0).replace("\\/", "/")
-
+        found = []
+    got = _best(found)
+    if got:
+        return got
+    if depth >= 2:
+        return None
+    try:
+        html = await asyncio.to_thread(lambda: http_get(url, ref).text)
+    except Exception:
+        return None
     for ifr in re.findall(r'<iframe[^>]+src="([^"]+)"', html):
         ifr = ifr.replace("\\/", "/")
         if ifr.startswith("//"):
             ifr = "https:" + ifr
         ifr = urllib.parse.urljoin(url, ifr)
-        got = await generic_resolve(ifr, url, depth + 1, seen)
-        if got:
-            return got
+        g = await generic_resolve(ifr, url, depth + 1, seen)
+        if g:
+            return g
     return None
 
 
 async def resolve(site_key, ep, kind):
     site = SITES[site_key]
+    cand = None
     if isinstance(site, WCO):
-        u = await asyncio.to_thread(site.resolve, ep["url"])
-        if u:
-            return u
-    if ep.get("id"):
-        servers = await asyncio.to_thread(site.servers, ep["id"])
+        try:
+            cand = await asyncio.to_thread(site.resolve, ep["url"])
+        except Exception:
+            cand = None
+    if not cand and ep.get("id"):
+        try:
+            servers = await asyncio.to_thread(site.servers, ep["id"])
+        except Exception:
+            servers = []
         wanted = [s for s in servers if s["kind"] == kind] or servers
         for s in wanted[:5]:
-            u = await asyncio.to_thread(site.source, s["id"])
+            try:
+                u = await asyncio.to_thread(site.source, s["id"])
+            except Exception:
+                u = None
             if u:
-                return u
+                cand = u
+                break
+    if cand and (".m3u8" in cand or ".mp4" in cand):
+        return cand
+    if cand:
+        got = await generic_resolve(cand, ep["url"])
+        if got:
+            return got
     return await generic_resolve(ep["url"], ep["url"])
 
 
 def download(url, ref, kind, height, outdir="/tmp/dl"):
     os.makedirs(outdir, exist_ok=True)
     tmpl = os.path.join(outdir, "ep.%(ext)s")
-    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--retries", "5",
-           "--fragment-retries", "20", "--concurrent-fragments", "8",
-           "--no-check-certificates",
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
+           "--retries", "5", "--fragment-retries", "20",
+           "--concurrent-fragments", "8", "--no-check-certificates",
+           "--socket-timeout", "30",
            "-f", f"bv*[height<={height}]+ba/b[height<={height}]/b",
            "--merge-output-format", "mp4", "--remux-video", "mp4",
            "-o", tmpl]
@@ -314,7 +434,6 @@ def download(url, ref, kind, height, outdir="/tmp/dl"):
 
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
-        # تلاش دوم با ffmpeg خام
         out = os.path.join(outdir, "ep.mp4")
         ff = ["ffmpeg", "-y", "-headers", f"Referer: {ref}\r\n",
               "-i", url, "-c", "copy", out]
@@ -332,30 +451,45 @@ def download(url, ref, kind, height, outdir="/tmp/dl"):
     return video, (subs[0] if subs else None)
 
 
-def split(path, limit=48 * 1024 * 1024):
+LIMIT = 42 * 1024 * 1024
+
+
+def split(path, limit=LIMIT):
     size = os.path.getsize(path)
     if size <= limit:
-        return [path]
-    dur = 0.0
-    try:
-        p = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                            "format=duration", "-of",
-                            "default=nw=1:nk=1", path],
-                           capture_output=True, text=True)
-        dur = float(p.stdout.strip())
-    except Exception:
-        dur = 0.0
-    if dur <= 0:
-        seg = 300
+        parts = [path]
     else:
-        seg = max(60, int(dur * (limit / size) * 0.85))
-    base = os.path.join(os.path.dirname(path), "part%03d.mp4")
-    subprocess.run(["ffmpeg", "-y", "-i", path, "-c", "copy", "-map", "0",
-                    "-f", "segment", "-segment_time", str(seg),
-                    "-reset_timestamps", "1", base],
-                   check=True, capture_output=True)
-    parts = sorted(glob.glob(os.path.join(os.path.dirname(path), "part*.mp4")))
-    return parts or [path]
+        dur = 0.0
+        try:
+            p = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                "format=duration", "-of",
+                                "default=nw=1:nk=1", path],
+                               capture_output=True, text=True)
+            dur = float(p.stdout.strip())
+        except Exception:
+            dur = 0.0
+        seg = 300 if dur <= 0 else max(45, int(dur * (limit / size) * 0.8))
+        base = os.path.join(os.path.dirname(path), "part%03d.mp4")
+        subprocess.run(["ffmpeg", "-y", "-i", path, "-c", "copy",
+                        "-map", "0:v", "-map", "0:a?", "-f", "segment",
+                        "-segment_time", str(seg), "-reset_timestamps", "1",
+                        base], check=True, capture_output=True)
+        parts = sorted(glob.glob(os.path.join(os.path.dirname(path), "part*.mp4")))
+        parts = parts or [path]
+
+    # faststart تا تلگرام ویدیو را قبول کند
+    out = []
+    for p in parts:
+        fs = p + ".fs.mp4"
+        r = subprocess.run(["ffmpeg", "-y", "-i", p, "-c", "copy",
+                            "-movflags", "+faststart", fs],
+                           capture_output=True)
+        if r.returncode == 0 and os.path.getsize(fs) > 0:
+            os.remove(p)
+            out.append(fs)
+        else:
+            out.append(p)
+    return out
 
 
 def cleanup(*paths):
@@ -365,17 +499,20 @@ def cleanup(*paths):
                 os.remove(p)
         except Exception:
             pass
+
+
 async def health():
     lines = []
     for key, site in SITES.items():
         def probe(base=site.base):
             try:
-                r = http_get(base, timeout=25)
-                return r.status_code
+                return http_get(base, timeout=25).status_code
             except Exception as e:
                 return f"خطا {type(e).__name__}"
         code = await asyncio.to_thread(probe)
+        if code in (403, 503):
+            await warm(site.base)
+            code = await asyncio.to_thread(probe)
         mark = "✅" if code == 200 else "❌"
         lines.append(f"{mark} {site.name}: {code}")
     return "\n".join(lines)
-      
