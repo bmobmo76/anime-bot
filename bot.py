@@ -4,7 +4,7 @@ import engine
 
 TOKEN = os.environ["BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
-RUN_SECONDS = 5.4 * 3600
+RUN_SECONDS = 5.2 * 3600
 START = time.time()
 LAST_ERROR = "بدون خطا"
 
@@ -38,22 +38,25 @@ client = httpx.AsyncClient(timeout=60)
 
 async def api(method, files=None, **params):
     try:
-        r = await client.post(f"{API}/{method}", data=params, files=files, timeout=300)
+        r = await client.post(f"{API}/{method}", data=params, files=files, timeout=600)
         return r.json()
     except Exception as e:
         return {"ok": False, "desc": str(e)}
 
 async def send(chat_id, text, kb=None):
-    p = {"chat_id": chat_id, "text": text}
+    p = {"chat_id": chat_id, "text": text[:4000]}
     if kb:
         p["reply_markup"] = json.dumps({"inline_keyboard": kb})
     return await api("sendMessage", **p)
 
 async def edit(chat_id, mid, text, kb=None):
-    p = {"chat_id": chat_id, "message_id": mid, "text": text}
+    p = {"chat_id": chat_id, "message_id": mid, "text": text[:4000]}
     if kb:
         p["reply_markup"] = json.dumps({"inline_keyboard": kb})
-    return await api("editMessageText", **p)
+    r = await api("editMessageText", **p)
+    if not r.get("ok"):
+        return await send(chat_id, text, kb)
+    return r
 
 async def send_video(chat_id, path, caption):
     with open(path, "rb") as f:
@@ -63,13 +66,19 @@ async def send_video(chat_id, path, caption):
 
 async def send_doc(chat_id, path, caption):
     with open(path, "rb") as f:
-        files = {"document": (os.path.basename(path), f, "text/plain")}
+        files = {"document": (os.path.basename(path), f, "application/octet-stream")}
         return await api("sendDocument", files=files, chat_id=chat_id, caption=caption)
 
+async def deliver(chat_id, path, caption):
+    r = await send_video(chat_id, path, caption)
+    if not r.get("ok"):
+        r = await send_doc(chat_id, path, caption)
+    return r
 
-HELP = ("اسم انیمه را بفرست.\n"
-        "سپس از دکمه‌ها سایت، نوع (زیرنویس/دوبله) و قسمت را انتخاب کن.\n"
-        "فایل به‌صورت بخش‌های ~۴۵ مگابایتی ارسال می‌شود.")
+
+HELP = ("اسم انگلیسی انیمه را بفرست.\n"
+        "بعد از دکمه‌ها سایت، نوع (زیرنویس/دوبله)، قسمت و کیفیت را انتخاب کن.\n"
+        "فایل به بخش‌های ~۴۰ مگابایتی تقسیم و ارسال می‌شود.")
 
 async def handle_message(msg):
     chat_id = msg["chat"]["id"]
@@ -77,7 +86,7 @@ async def handle_message(msg):
     if not text:
         return
     if text.startswith("/start"):
-        await send(chat_id, "سلام 👋\n" + HELP)
+        await send(chat_id, "سلام\n" + HELP)
         return
     if text.startswith("/help"):
         await send(chat_id, HELP)
@@ -90,13 +99,12 @@ async def handle_message(msg):
         return
     if text.startswith("/debug"):
         await send(chat_id, "بررسی دسترسی به سایت‌ها...")
-        report = await engine.health()
-        await send(chat_id, report)
+        await send(chat_id, await engine.health())
         return
     if text.startswith("/"):
         return
 
-    await send(chat_id, f"🔎 جستجوی «{text}» در ۵ سایت...")
+    await send(chat_id, f"جستجوی «{text}» در ۵ سایت...")
     results = await engine.search_all(text)
     if not results:
         await send(chat_id, "چیزی پیدا نشد. نام انگلیسی را امتحان کن.")
@@ -135,7 +143,7 @@ async def handle_callback(cb):
         job = state["jobs"].get(jid)
         if not job:
             return await edit(chat_id, mid, "منقضی شد.")
-        await edit(chat_id, mid, "⏳ گرفتن لیست قسمت‌ها...")
+        await edit(chat_id, mid, "در حال گرفتن لیست قسمت‌ها...")
         try:
             eps = await asyncio.to_thread(
                 engine.SITES[job["site"]].episodes, job["anime_url"])
@@ -164,7 +172,7 @@ async def handle_callback(cb):
         job = state["jobs"].get(jid)
         if not job:
             return await edit(chat_id, mid, "منقضی شد.")
-        await edit(chat_id, mid, f"⬇️ قسمت {num} در حال دانلود...")
+        await edit(chat_id, mid, f"قسمت {num} در حال دانلود...")
         asyncio.create_task(run_job(job, num, height))
 
 
@@ -185,9 +193,9 @@ async def show_page(chat_id, mid, jid, page):
         rows.append(row)
     nav = []
     if page > 0:
-        nav.append({"text": "◀️", "callback_data": f"p|{jid}|{page - 1}"})
+        nav.append({"text": "◀", "callback_data": f"p|{jid}|{page - 1}"})
     if (page + 1) * per < len(eps):
-        nav.append({"text": "▶️", "callback_data": f"p|{jid}|{page + 1}"})
+        nav.append({"text": "▶", "callback_data": f"p|{jid}|{page + 1}"})
     if nav:
         rows.append(nav)
     await edit(chat_id, mid, f"{job['title']} — {job['kind']}\nقسمت را انتخاب کن:", rows)
@@ -205,6 +213,7 @@ async def run_job(job, num, height):
             return
 
         tmpdir = f"/tmp/dl/{job['jid']}-{num}"
+        shutil.rmtree(tmpdir, ignore_errors=True)
         loop = asyncio.get_running_loop()
 
         try:
@@ -212,10 +221,9 @@ async def run_job(job, num, height):
         except Exception as e:
             url = None
             LAST_ERROR = f"resolve: {e}"
-            await send(chat_id, f"خطا در استخراج لینک: {e}")
         if not url:
-            await send(chat_id, "لینک این قسمت درنیامد (احتمالاً سرور دوبله ندارد "
-                                "یا ساختار سایت عوض شده).")
+            await send(chat_id, "لینک این قسمت درنیامد (احتمالاً سرور این نسخه "
+                                "وجود ندارد یا ساختار سایت عوض شده).")
             return
 
         try:
@@ -223,29 +231,35 @@ async def run_job(job, num, height):
                 None, engine.download, url, ep["url"], job["kind"], height, tmpdir)
         except Exception as e:
             LAST_ERROR = f"download: {str(e)[:200]}"
-            await send(chat_id, f"❌ دانلود نشد:\n{str(e)[:300]}")
+            await send(chat_id, f"دانلود نشد:\n{str(e)[:300]}")
+            shutil.rmtree(tmpdir, ignore_errors=True)
             return
 
         try:
             parts = await loop.run_in_executor(None, engine.split, video)
         except Exception as e:
             LAST_ERROR = f"split: {e}"
-            await send(chat_id, f"❌ تقسیم فایل نشد: {e}")
+            await send(chat_id, f"تقسیم فایل نشد: {e}")
+            shutil.rmtree(tmpdir, ignore_errors=True)
             return
+
+        if len(parts) > 1:
+            engine.cleanup(video)
 
         for i, p in enumerate(parts):
             cap = f"{job['title']} — قسمت {num}"
             if len(parts) > 1:
                 cap += f" (بخش {i + 1}/{len(parts)})"
-            ok = await send_video(chat_id, p, cap)
-            if not ok.get("ok"):
-                await send(chat_id, f"ارسال بخش {i + 1} نشد: {ok.get('desc')}")
+            r = await deliver(chat_id, p, cap)
+            if not r.get("ok"):
+                LAST_ERROR = f"upload: {r.get('desc')}"
+                await send(chat_id, f"ارسال بخش {i + 1} نشد: {r.get('desc')}")
+            engine.cleanup(p)
             await asyncio.sleep(1)
 
         if subs:
             await send_doc(chat_id, subs, "زیرنویس انگلیسی")
 
-        engine.cleanup(video, subs, *parts)
         shutil.rmtree(tmpdir, ignore_errors=True)
         state["jobs"].pop(job["jid"], None)
         save()
@@ -284,6 +298,7 @@ async def poll():
 
 async def main():
     print(await api("getMe"))
+    await engine.warm_all()
     await poll()
     await client.aclose()
 
