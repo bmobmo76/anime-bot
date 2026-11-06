@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: stamp
+        run: date +%s > .started
+
       - name: free disk
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
@@ -37,6 +40,11 @@ jobs:
           sudo apt-get install -y -qq ffmpeg
           pip install -q -r requirements.txt
           python -m playwright install --with-deps chromium
+
+      - name: verify
+        run: |
+          python -m py_compile engine.py bot.py && echo "syntax OK"
+          python -c "import engine; print('sites:', list(engine.SITES))"
 
       - name: run
         env:
@@ -65,6 +73,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          now=$(date +%s)
+          start=$(cat .started 2>/dev/null || echo 0)
+          lived=$(( now - start ))
+          echo "lived=${lived}s"
+          if [ "$lived" -lt 10800 ]; then
+            echo "short run - cron will pick it up"
+            exit 0
+          fi
           curl -s -o /dev/null -w "%{http_code}\n" -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
