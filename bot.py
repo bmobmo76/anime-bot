@@ -306,6 +306,11 @@ async def one_ep(job, num):
             url = None
         if not url:
             await edit(chat_id, mid, f"قسمت {num}: لینک درنیامد.")
+            try:
+                rep = await engine.debug_ep(ep, job["kind"], c["q"])
+            except Exception as e:
+                rep = f"debug خطا: {e}"
+            await send(chat_id, rep[:3500])
             return
 
         def prog(pct):
