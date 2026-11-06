@@ -489,6 +489,66 @@ async def resolve(job, ep, kind, height=720):
             return got
     return None
 
+async def debug_ep(ep, kind, height):
+    L = [f"mal={ep.get('mal')} slug={ep.get('slug')} ts={ep.get('ts')}"]
+    try:
+        html = await asyncio.to_thread(lambda: http_get(ep["url"]).text)
+        L.append(f"صفحه: {len(html)} کاراکتر، w-servers={'#w-servers' in html}")
+        soup = BeautifulSoup(html, "lxml")
+        lis = soup.select("#w-servers li[data-link-id]")
+        L.append(f"تعداد li سرور: {len(lis)}")
+        if lis:
+            L.append("کلیدها: " + ",".join(lis[0].attrs))
+    except Exception as e:
+        L.append(f"صفحه خطا: {type(e).__name__} {e}")
+
+    mal, slug, ts = ep.get("mal"), ep.get("slug"), ep.get("ts")
+    if mal and slug and ts:
+        try:
+            r = await asyncio.to_thread(
+                lambda: http_get(f"{MAPPER}{mal}/{slug}/{ts}"))
+            L.append(f"mapper: {r.status_code} {r.text[:200]}")
+            try:
+                j = r.json()
+            except Exception:
+                j = {}
+            for name, src in j.items():
+                if isinstance(src, dict) and isinstance(src.get(kind), dict):
+                    d = src[kind].get("download") or {}
+                    L.append(f"{name}.{kind}: {json.dumps(d)[:200]}")
+                    for k, v in list(d.items())[:1]:
+                        fid = str(v).rsplit("/", 1)[-1]
+                        for host in ("https://testpahe.nekostream.site/",
+                                     "https://pahe.nekostream.site/"):
+                            try:
+                                rr = await asyncio.to_thread(
+                                    lambda h=host, f=fid: http_get(h + f, ref=host))
+                                L.append(f"{host.split('//')[1]}{fid}: "
+                                         f"{rr.status_code} "
+                                         f"{rr.headers.get('content-type')} "
+                                         f"-> {rr.url[:70]}")
+                            except Exception as e:
+                                L.append(f"{host}: {type(e).__name__}")
+        except Exception as e:
+            L.append(f"mapper خطا: {type(e).__name__} {e}")
+    else:
+        L.append("mapper: mal/slug/ts ندارد")
+
+    try:
+        u = await asyncio.to_thread(
+            SITES["anikoto"].ajax_source, ep["url"], kind)
+        L.append(f"ajax_server: {u}")
+    except Exception as e:
+        L.append(f"ajax خطا: {type(e).__name__}")
+
+    try:
+        found = await js_capture(ep["url"], ep["url"], wait_ms=15000)
+        L.append(f"capture: {len(found)} {found[:2]}")
+    except Exception as e:
+        L.append(f"capture خطا: {type(e).__name__}")
+
+    return "\n".join(L)
+
 
 def download(url, ref, kind, height, outdir, on_progress=None):
     os.makedirs(outdir, exist_ok=True)
