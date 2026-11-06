@@ -1,4 +1,4 @@
-import asyncio, json, os, pathlib, shutil, time, traceback
+import asyncio, json, os, pathlib, shutil, sys, time, traceback
 import httpx
 import engine
 
@@ -369,13 +369,24 @@ async def poll():
     print("پایان چرخه")
 
 async def main():
-    print(await api("getMe"))
-    await engine.warm_all()
+    print("py", sys.version.split()[0], "token_len", len(TOKEN))
+    print("getMe:", await api("getMe"))
+    try:
+        await engine.warm_all()
+        print("warm ok")
+    except Exception:
+        print("warm failed\n" + traceback.format_exc())
+    print("polling now")
     await poll()
     await client.aclose()
 
 try:
     asyncio.run(main())
-except Exception:
-    traceback.print_exc()
+except BaseException:
+    tb = traceback.format_exc()
+    print(tb)
+    try:
+        (DATA / "last_error.txt").write_text(tb)
+    except Exception:
+        pass
     raise SystemExit(1)
