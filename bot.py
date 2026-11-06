@@ -301,7 +301,7 @@ async def one_ep(job, num):
         mid = msg.get("result", {}).get("message_id")
 
         try:
-            url = await engine.resolve(job, ep, job["kind"])
+            url = await engine.resolve(job, ep, job["kind"], c["q"])
         except Exception:
             url = None
         if not url:
