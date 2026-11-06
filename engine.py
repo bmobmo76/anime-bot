@@ -183,7 +183,7 @@ class Kai(Site):
             out.append({"title": title, "url": url.rstrip("/"), "site": self.key})
         return _dedup(out)[:12]
 
-   def episodes(self, url):
+    def episodes(self, url):
         return self.parse_eps(http_get(url).text, url)
 
     def parse_eps(self, html, url):
@@ -201,7 +201,6 @@ class Kai(Site):
         return _dedup(out)
 
     def kinds(self, ep_url):
-        """کدام نسخه‌ها موجود است."""
         try:
             html = http_get(ep_url).text
         except Exception:
@@ -226,7 +225,6 @@ class Kai(Site):
         except Exception:
             return None
         return None
-
 
 class WCO(Site):
     def search(self, q):
