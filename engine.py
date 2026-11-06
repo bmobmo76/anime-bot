@@ -165,6 +165,9 @@ class Site:
         raise NotImplementedError
 
 
+MAPPER = "https://mapper.nekostream.site/api/mal/"
+
+
 class Kai(Site):
     """خانوادهٔ animekai/anikoto/aniwave"""
 
@@ -196,34 +199,78 @@ class Kai(Site):
             if not num:
                 continue
             out.append({"num": str(num), "id": a.get("data-id"),
-                        "url": f"{url}/ep-{num}"})
+                        "url": f"{url}/ep-{num}",
+                        "mal": a.get("data-mal"),
+                        "slug": a.get("data-slug"),
+                        "ts": a.get("data-timestamp")})
         out.sort(key=lambda x: float(x["num"]))
         return _dedup(out)
 
-    def kinds(self, ep_url):
+    def mapper_file(self, ep, height, kind):
+        mal, slug, ts = ep.get("mal"), ep.get("slug"), ep.get("ts")
+        if not (mal and slug and ts):
+            return None
+        try:
+            j = http_get(f"{MAPPER}{mal}/{slug}/{ts}").json()
+        except Exception:
+            return None
+        for src in j.values():
+            if not isinstance(src, dict):
+                continue
+            d = src.get(kind)
+            if not isinstance(d, dict):
+                continue
+            table = {k: v for k, v in (d.get("download") or {}).items() if v}
+            if not table:
+                continue
+            def q(k):
+                m = re.match(r"(\d+)", k)
+                return int(m.group(1)) if m else 0
+            ok = [k for k in table if q(k) <= height]
+            pick = table[max(ok, key=q) if ok else min(table, key=q)]
+            m = re.search(r"/([A-Za-z0-9]+)/?$", pick)
+            if not m:
+                continue
+            fid = m.group(1)
+            for host in ("https://testpahe.nekostream.site/",
+                         "https://pahe.nekostream.site/"):
+                try:
+                    rr = http_get(host + fid, ref="https://pahe.nekostream.site/")
+                except Exception:
+                    continue
+                ct = rr.headers.get("content-type", "")
+                if rr.status_code == 200 and "text/html" not in ct:
+                    return rr.url
+                if rr.status_code == 200 and ".mp4" in rr.url:
+                    return rr.url
+        return None
+
+    def ajax_source(self, ep_url, kind):
         try:
             html = http_get(ep_url).text
         except Exception:
-            return set()
+            return None
         soup = BeautifulSoup(html, "lxml")
-        out = set()
-        for d in soup.select("#w-servers .type[data-type]"):
-            if d.select("li[data-link-id]"):
-                out.add(d.get("data-type"))
-        return out
-
-    def direct(self, ep_url):
-        html = http_get(ep_url).text
-        m = re.search(r'download-data="([^"]+)"', html)
-        if not m:
+        box = (soup.select_one(f"#w-servers .type[data-type='{kind}']")
+               or soup.select_one("#w-servers .type"))
+        if not box:
             return None
-        try:
-            raw = base64.b64decode(m.group(1) + "=" * (-len(m.group(1)) % 4))
-            for it in json.loads(raw.decode("utf-8", "ignore")):
-                if it.get("url"):
-                    return it["url"]
-        except Exception:
-            return None
+        for li in box.select("li[data-link-id]")[:4]:
+            lid = li.get("data-link-id")
+            sv = li.get("data-sv-id")
+            if not lid:
+                continue
+            h = _headers(ep_url)
+            h["X-Requested-With"] = "XMLHttpRequest"
+            try:
+                r = creq.get(f"{self.base}/ajax/server",
+                             params={"get": sv, "id": lid}, headers=h,
+                             impersonate="chrome", timeout=30)
+                res = r.json().get("result")
+                if isinstance(res, dict) and res.get("url"):
+                    return res["url"]
+            except Exception:
+                continue
         return None
 
 class WCO(Site):
@@ -384,24 +431,29 @@ async def get_episodes(site_key, url):
                 f"{(t.group(1).strip()[:80] if t else 'ندارد')}")
 
 
-async def resolve_one(site_key, ep, kind):
+async def resolve_one(site_key, ep, kind, height=720):
     site = SITES[site_key]
     if isinstance(site, Kai):
-        try:
-            u = await asyncio.to_thread(site.direct, ep["url"])
-        except Exception:
-            u = None
+        u = await asyncio.to_thread(site.mapper_file, ep, height, kind)
         if u:
             return u
+        u = await asyncio.to_thread(site.ajax_source, ep["url"], kind)
+        if u and any(x in u for x in (".m3u8", ".mp4", ".mkv")):
+            return u
+        if u:
+            got = await generic_resolve(u, ep["url"])
+            if got:
+                return got
         sel = ("#w-servers .type[data-type='dub'] li" if kind == "dub"
                else "#w-servers .type[data-type='sub'] li")
         got = await generic_resolve(ep["url"], ep["url"], click=sel)
         return got or await generic_resolve(ep["url"], ep["url"])
+
     try:
         u = await asyncio.to_thread(site.resolve, ep["url"])
     except Exception:
         u = None
-    if u and (".m3u8" in u or ".mp4" in u):
+    if u and any(x in u for x in (".m3u8", ".mp4", ".mkv")):
         return u
     if u:
         got = await generic_resolve(u, ep["url"])
@@ -410,9 +462,8 @@ async def resolve_one(site_key, ep, kind):
     return await generic_resolve(ep["url"], ep["url"])
 
 
-async def resolve(job, ep, kind):
-    """اول سایت انتخابی، بعد بقیهٔ سایت‌ها با همان عنوان."""
-    got = await resolve_one(job["site"], ep, kind)
+async def resolve(job, ep, kind, height=720):
+    got = await resolve_one(job["site"], ep, kind, height)
     if got:
         return got
     key = norm(job["title"])
@@ -433,7 +484,7 @@ async def resolve(job, ep, kind):
         e2 = next((e for e in eps if e["num"] == ep["num"]), None)
         if not e2:
             continue
-        got = await resolve_one(sk, e2, kind)
+        got = await resolve_one(sk, e2, kind, height)
         if got:
             return got
     return None
