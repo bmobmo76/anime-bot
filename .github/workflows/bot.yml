@@ -63,6 +63,8 @@ jobs:
       - name: keepalive
         if: always()
         run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
           date > .keepalive
           git add -A .keepalive data 2>/dev/null || true
           git commit -m "keepalive" || true
