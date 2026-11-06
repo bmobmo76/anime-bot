@@ -186,11 +186,11 @@ async def handle_callback(cb):
         save()
         await edit(chat_id, mid, "بررسی نسخه‌های موجود...")
         try:
-            eps = await asyncio.to_thread(engine.SITES[r["site"]].episodes, r["url"])
+            eps, info = await engine.get_episodes(r["site"], r["url"])
         except Exception as e:
             return await edit(chat_id, mid, f"لیست قسمت‌ها نیامد: {e}")
         if not eps:
-            return await edit(chat_id, mid, "قسمتی پیدا نشد.")
+            return await edit(chat_id, mid, f"قسمتی پیدا نشد.\n{info}")
         job["episodes"] = eps
         save()
         kb = [[{"text": "زیرنویس انگلیسی", "callback_data": f"k|{p[1]}|sub"}],
