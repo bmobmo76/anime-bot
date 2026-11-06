@@ -5,7 +5,10 @@ from curl_cffi import requests as creq
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
+MAPPER = "https://mapper.nekostream.site/api/mal/"
+
 _cookies = {}
+HDRS = {}
 
 
 def _headers(ref=None):
@@ -24,8 +27,10 @@ def _cookie_header(url):
     return None
 
 
-def http_get(url, ref=None, **kw):
+def http_get(url, ref=None, extra=None, **kw):
     h = _headers(ref)
+    if extra:
+        h.update(extra)
     ck = _cookie_header(url)
     if ck:
         h["Cookie"] = ck
@@ -110,7 +115,7 @@ async def js_capture(url, ref=None, click=None, wait_ms=12000):
 
     def on_req(req):
         u = req.url
-        if ".m3u8" in u or ".mp4" in u:
+        if ".m3u8" in u or ".mp4" in u or ".mkv" in u:
             found.append(u)
 
     page.on("request", on_req)
@@ -139,9 +144,21 @@ async def js_capture(url, ref=None, click=None, wait_ms=12000):
     finally:
         await ctx.close()
 
-    for m in re.findall(r'https?://[^"\'\\\s]+?\.(?:m3u8|mp4)[^"\'\\\s]*', html):
+    for m in re.findall(r'https?://[^"\'\\\s]+?\.(?:m3u8|mp4|mkv)[^"\'\\\s]*', html):
         found.append(m.replace("\\/", "/"))
     return list(dict.fromkeys(found))
+
+
+async def js_html(url, wait_ms=7000):
+    b = await _get_browser()
+    ctx = await b.new_context(user_agent=UA, locale="en-US")
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(wait_ms)
+        return await page.content()
+    finally:
+        await ctx.close()
 
 
 def _best(urls):
@@ -156,6 +173,11 @@ def _best(urls):
     return urls[0]
 
 
+def _q(k):
+    m = re.match(r"(\d+)", k)
+    return int(m.group(1)) if m else 0
+
+
 class Site:
     key = ""
     name = ""
@@ -163,9 +185,6 @@ class Site:
 
     def search(self, q):
         raise NotImplementedError
-
-
-MAPPER = "https://mapper.nekostream.site/api/mal/"
 
 
 class Kai(Site):
@@ -206,7 +225,7 @@ class Kai(Site):
         out.sort(key=lambda x: float(x["num"]))
         return _dedup(out)
 
-    def mapper_file(self, ep, height, kind):
+    def _table(self, ep, kind):
         mal, slug, ts = ep.get("mal"), ep.get("slug"), ep.get("ts")
         if not (mal and slug and ts):
             return None
@@ -215,35 +234,64 @@ class Kai(Site):
         except Exception:
             return None
         for src in j.values():
-            if not isinstance(src, dict):
+            if not isinstance(src, dict) or not isinstance(src.get(kind), dict):
                 continue
-            d = src.get(kind)
-            if not isinstance(d, dict):
-                continue
-            table = {k: v for k, v in (d.get("download") or {}).items() if v}
-            if not table:
-                continue
-            def q(k):
-                m = re.match(r"(\d+)", k)
-                return int(m.group(1)) if m else 0
-            ok = [k for k in table if q(k) <= height]
-            pick = table[max(ok, key=q) if ok else min(table, key=q)]
-            m = re.search(r"/([A-Za-z0-9]+)/?$", pick)
-            if not m:
-                continue
-            fid = m.group(1)
-            for host in ("https://testpahe.nekostream.site/",
-                         "https://pahe.nekostream.site/"):
-                try:
-                    rr = http_get(host + fid, ref="https://pahe.nekostream.site/")
-                except Exception:
-                    continue
-                ct = rr.headers.get("content-type", "")
-                if rr.status_code == 200 and "text/html" not in ct:
-                    return rr.url
-                if rr.status_code == 200 and ".mp4" in rr.url:
-                    return rr.url
+            t = {k: v for k, v in (src[kind].get("download") or {}).items() if v}
+            if t:
+                return t
         return None
+
+    def short_link(self, ep, height, kind):
+        t = self._table(ep, kind)
+        if not t:
+            return None
+        ok = [k for k in t if _q(k) <= height]
+        return t[max(ok, key=_q) if ok else min(t, key=_q)]
+
+    def mapper_file(self, ep, height, kind):
+        pick = self.short_link(ep, height, kind)
+        if not pick:
+            return None
+        m = re.search(r"/([A-Za-z0-9]+)/?$", pick)
+        if not m:
+            return None
+        fid = m.group(1)
+        nav = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+               "Sec-Fetch-Site": "cross-site",
+               "Upgrade-Insecure-Requests": "1"}
+        tries = [
+            (f"https://testpahe.nekostream.site/{fid}", pick, nav),
+            (f"https://testpahe.nekostream.site/{fid}", pick, None),
+            (f"https://testpahe.nekostream.site/{fid}",
+             "https://pahe.nekostream.site/", None),
+            (f"https://pahe.nekostream.site/{fid}", pick, None),
+        ]
+        for url, ref, extra in tries:
+            try:
+                rr = http_get(url, ref=ref, extra=extra)
+            except Exception:
+                continue
+            if rr.status_code == 200 and "text/html" not in rr.headers.get(
+                    "content-type", ""):
+                return rr.url
+        return None
+
+    async def browser_file(self, short_url):
+        b = await _get_browser()
+        ctx = await b.new_context(user_agent=UA, locale="en-US")
+        page = await ctx.new_page()
+        try:
+            fid = short_url.rstrip("/").rsplit("/", 1)[-1]
+            await page.goto(f"https://testpahe.nekostream.site/{fid}",
+                            referer="https://pahe.nekostream.site/",
+                            wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2500)
+            final = page.url
+            ck = await ctx.cookies()
+            cookie = "; ".join(f"{c['name']}={c['value']}" for c in ck)
+            return final, cookie
+        finally:
+            await ctx.close()
 
     def ajax_source(self, ep_url, kind):
         try:
@@ -272,6 +320,19 @@ class Kai(Site):
             except Exception:
                 continue
         return None
+
+    def kinds(self, ep_url):
+        try:
+            html = http_get(ep_url).text
+        except Exception:
+            return set()
+        soup = BeautifulSoup(html, "lxml")
+        out = set()
+        for d in soup.select("#w-servers .type[data-type]"):
+            if d.select("li[data-link-id]"):
+                out.add(d.get("data-type"))
+        return out
+
 
 class WCO(Site):
     def search(self, q):
@@ -389,18 +450,6 @@ async def generic_resolve(url, ref=None, click=None):
     return _best(found)
 
 
-async def js_html(url, wait_ms=7000):
-    b = await _get_browser()
-    ctx = await b.new_context(user_agent=UA, locale="en-US")
-    page = await ctx.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(wait_ms)
-        return await page.content()
-    finally:
-        await ctx.close()
-
-
 async def get_episodes(site_key, url):
     site = SITES[site_key]
     if not isinstance(site, Kai):
@@ -433,10 +482,22 @@ async def get_episodes(site_key, url):
 
 async def resolve_one(site_key, ep, kind, height=720):
     site = SITES[site_key]
+
     if isinstance(site, Kai):
         u = await asyncio.to_thread(site.mapper_file, ep, height, kind)
         if u:
             return u
+        short = await asyncio.to_thread(site.short_link, ep, height, kind)
+        if short:
+            try:
+                final, cookie = await site.browser_file(short)
+            except Exception:
+                final, cookie = None, ""
+            if final and "text/html" not in final and final != short:
+                if cookie:
+                    HDRS[final] = {"Cookie": cookie,
+                                   "Referer": "https://pahe.nekostream.site/"}
+                return final
         u = await asyncio.to_thread(site.ajax_source, ep["url"], kind)
         if u and any(x in u for x in (".m3u8", ".mp4", ".mkv")):
             return u
@@ -489,6 +550,7 @@ async def resolve(job, ep, kind, height=720):
             return got
     return None
 
+
 async def debug_ep(ep, kind, height):
     L = [f"mal={ep.get('mal')} slug={ep.get('slug')} ts={ep.get('ts')}"]
     try:
@@ -497,42 +559,24 @@ async def debug_ep(ep, kind, height):
         soup = BeautifulSoup(html, "lxml")
         lis = soup.select("#w-servers li[data-link-id]")
         L.append(f"تعداد li سرور: {len(lis)}")
-        if lis:
-            L.append("کلیدها: " + ",".join(lis[0].attrs))
     except Exception as e:
         L.append(f"صفحه خطا: {type(e).__name__} {e}")
 
-    mal, slug, ts = ep.get("mal"), ep.get("slug"), ep.get("ts")
-    if mal and slug and ts:
-        try:
-            r = await asyncio.to_thread(
-                lambda: http_get(f"{MAPPER}{mal}/{slug}/{ts}"))
-            L.append(f"mapper: {r.status_code} {r.text[:200]}")
-            try:
-                j = r.json()
-            except Exception:
-                j = {}
-            for name, src in j.items():
-                if isinstance(src, dict) and isinstance(src.get(kind), dict):
-                    d = src[kind].get("download") or {}
-                    L.append(f"{name}.{kind}: {json.dumps(d)[:200]}")
-                    for k, v in list(d.items())[:1]:
-                        fid = str(v).rsplit("/", 1)[-1]
-                        for host in ("https://testpahe.nekostream.site/",
-                                     "https://pahe.nekostream.site/"):
-                            try:
-                                rr = await asyncio.to_thread(
-                                    lambda h=host, f=fid: http_get(h + f, ref=host))
-                                L.append(f"{host.split('//')[1]}{fid}: "
-                                         f"{rr.status_code} "
-                                         f"{rr.headers.get('content-type')} "
-                                         f"-> {rr.url[:70]}")
-                            except Exception as e:
-                                L.append(f"{host}: {type(e).__name__}")
-        except Exception as e:
-            L.append(f"mapper خطا: {type(e).__name__} {e}")
-    else:
-        L.append("mapper: mal/slug/ts ندارد")
+    try:
+        t = await asyncio.to_thread(SITES["anikoto"]._table, ep, kind)
+        L.append(f"جدول دانلود: {json.dumps(t)[:250] if t else 'خالی'}")
+    except Exception as e:
+        L.append(f"جدول خطا: {type(e).__name__} {e}")
+
+    try:
+        short = await asyncio.to_thread(
+            SITES["anikoto"].short_link, ep, height, kind)
+        L.append(f"short: {short}")
+        if short:
+            final, ck = await SITES["anikoto"].browser_file(short)
+            L.append(f"browser: {final[:110]} cookie={len(ck)}")
+    except Exception as e:
+        L.append(f"browser خطا: {type(e).__name__} {e}")
 
     try:
         u = await asyncio.to_thread(
@@ -562,6 +606,8 @@ def download(url, ref, kind, height, outdir, on_progress=None):
            "-o", tmpl]
     if ref:
         cmd += ["--referer", ref, "--add-header", f"Origin:{origin(ref)}"]
+    for k, v in HDRS.get(url, {}).items():
+        cmd += ["--add-header", f"{k}: {v}"]
     if kind == "sub":
         cmd += ["--write-subs", "--write-auto-subs",
                 "--sub-langs", "en,en-US,eng", "--convert-subs", "srt"]
@@ -584,9 +630,12 @@ def download(url, ref, kind, height, outdir, on_progress=None):
 
     if rc != 0:
         out = os.path.join(outdir, "ep.mp4")
-        r2 = subprocess.run(["ffmpeg", "-y", "-headers",
-                             f"Referer: {ref}\r\n", "-i", url,
-                             "-c", "copy", out], capture_output=True, text=True)
+        hdrs = f"Referer: {ref}\r\n"
+        for k, v in HDRS.get(url, {}).items():
+            hdrs += f"{k}: {v}\r\n"
+        r2 = subprocess.run(["ffmpeg", "-y", "-headers", hdrs,
+                             "-i", url, "-c", "copy", out],
+                            capture_output=True, text=True)
         if r2.returncode != 0:
             raise RuntimeError("".join(tail)[-400:])
         return out, None
@@ -606,8 +655,7 @@ def mux_subs(video, subs):
     r = subprocess.run(["ffmpeg", "-y", "-i", video, "-i", subs,
                         "-c", "copy", "-c:s", "mov_text",
                         "-metadata:s:s:0", "language=eng",
-                        "-movflags", "+faststart", out],
-                       capture_output=True)
+                        "-movflags", "+faststart", out], capture_output=True)
     if r.returncode == 0 and os.path.getsize(out) > 0:
         return out
     return video
