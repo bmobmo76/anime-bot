@@ -183,18 +183,21 @@ class Kai(Site):
             out.append({"title": title, "url": url.rstrip("/"), "site": self.key})
         return _dedup(out)[:12]
 
-    def episodes(self, url):
+   def episodes(self, url):
+        return self.parse_eps(http_get(url).text, url)
+
+    def parse_eps(self, html, url):
         url = url.rstrip("/")
-        html = http_get(url).text
         soup = BeautifulSoup(html, "lxml")
         out = []
-        for a in soup.select("#w-episodes a[data-num]"):
-            num = a.get("data-num")
-            if num is None:
+        for a in soup.select("#w-episodes a[href]"):
+            m = re.search(r"/ep-([0-9]+(?:\.[0-9]+)?)", a.get("href") or "")
+            num = a.get("data-num") or (m.group(1) if m else None)
+            if not num:
                 continue
             out.append({"num": str(num), "id": a.get("data-id"),
                         "url": f"{url}/ep-{num}"})
-        out.sort(key=lambda x: int(float(x["num"])))
+        out.sort(key=lambda x: float(x["num"]))
         return _dedup(out)
 
     def kinds(self, ep_url):
@@ -339,6 +342,48 @@ async def generic_resolve(url, ref=None, click=None):
     except Exception:
         return None
     return _best(found)
+
+
+async def js_html(url, wait_ms=7000):
+    b = await _get_browser()
+    ctx = await b.new_context(user_agent=UA, locale="en-US")
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(wait_ms)
+        return await page.content()
+    finally:
+        await ctx.close()
+
+
+async def get_episodes(site_key, url):
+    site = SITES[site_key]
+    if not isinstance(site, Kai):
+        try:
+            return await asyncio.to_thread(site.episodes, url), ""
+        except Exception as e:
+            return [], f"خطا: {e}"
+
+    html = ""
+    try:
+        html = await asyncio.to_thread(lambda: http_get(url).text)
+        eps = site.parse_eps(html, url)
+        if eps:
+            return eps, ""
+    except Exception as e:
+        html = f"GET خطا: {e}"
+
+    try:
+        html2 = await js_html(url)
+        eps = site.parse_eps(html2, url)
+        if eps:
+            return eps, ""
+    except Exception:
+        pass
+
+    t = re.search(r"<title>(.*?)</title>", html or "", re.S)
+    return [], (f"صفحه {len(html or '')} کاراکتر، عنوان: "
+                f"{(t.group(1).strip()[:80] if t else 'ندارد')}")
 
 
 async def resolve_one(site_key, ep, kind):
