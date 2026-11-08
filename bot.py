@@ -185,10 +185,7 @@ async def handle_callback(cb):
         job.update(site=r["site"], anime_url=r["url"], title=r["title"])
         save()
         await edit(chat_id, mid, "بررسی نسخه‌های موجود...")
-        try:
-            eps, info = await engine.get_episodes(r["site"], r["url"])
-        except Exception as e:
-            return await edit(chat_id, mid, f"لیست قسمت‌ها نیامد: {e}")
+        eps, info = await engine.get_episodes(r["site"], r["url"])
         if not eps:
             return await edit(chat_id, mid, f"قسمتی پیدا نشد.\n{info}")
         job["episodes"] = eps
@@ -276,7 +273,6 @@ async def run_batch(job):
         try:
             await one_ep(job, n)
         except Exception as e:
-            LAST_ERROR = f"ep{n}: {str(e)[:150]}"
             await send(job["chat_id"], f"قسمت {n} نشد:\n{str(e)[:200]}")
         await asyncio.sleep(1)
     state["jobs"].pop(job["jid"], None)
@@ -302,8 +298,9 @@ async def one_ep(job, num):
 
         try:
             url = await engine.resolve(job, ep, job["kind"], c["q"])
-        except Exception:
+        except Exception as e:
             url = None
+            await send(chat_id, f"resolve: {str(e)[:300]}")
         if not url:
             await edit(chat_id, mid, f"قسمت {num}: لینک درنیامد.")
             try:
@@ -321,7 +318,8 @@ async def one_ep(job, num):
             video, subs = await loop.run_in_executor(
                 None, engine.download, url, ep["url"], job["kind"], c["q"], tmp, prog)
         except Exception as e:
-            await edit(chat_id, mid, f"قسمت {num}: دانلود نشد\n{str(e)[:200]}")
+            await edit(chat_id, mid, f"قسمت {num}: دانلود نشد")
+            await send(chat_id, str(e)[:1300])
             shutil.rmtree(tmp, ignore_errors=True)
             return
 
