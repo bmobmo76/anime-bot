@@ -284,7 +284,6 @@ class Kai(Site):
         return t[max(ok, key=_q) if ok else min(t, key=_q)]
 
     async def browser_file(self, short_url):
-        """pahe → testpahe → kwik، و گرفتن mp4 واقعی"""
         b = await _get_browser()
         ctx = await b.new_context(user_agent=UA, locale="en-US")
         page = await ctx.new_page()
@@ -298,20 +297,33 @@ class Kai(Site):
         try:
             await page.goto(short_url, referer="https://pahe.nekostream.site/",
                             wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(3000)
 
-            if "kwik.cx" in page.url:
-                for sel in ("#btn-download", "button.btn", "a.btn",
-                            "button", ".download"):
+            for _ in range(3):
+                if "pahe.nekostream.site" not in page.url:
+                    break
+                for sel in ("button.btn", "button", "a.btn"):
                     try:
-                        await page.click(sel, timeout=4000)
+                        await page.click(sel, timeout=3000)
                         break
                     except Exception:
                         continue
-                for _ in range(36):
+                await page.wait_for_timeout(2500)
+
+            if "kwik.cx" in page.url:
+                for _ in range(2):
+                    for sel in ("#btn-download", "button.btn", "a.btn", "button"):
+                        try:
+                            await page.click(sel, timeout=3000)
+                            break
+                        except Exception:
+                            continue
+                    for _ in range(30):
+                        if found:
+                            break
+                        await page.wait_for_timeout(500)
                     if found:
                         break
-                    await page.wait_for_timeout(500)
                 try:
                     html = await page.content()
                     for m in re.findall(
@@ -535,7 +547,14 @@ async def resolve_one(site_key, ep, kind, height=720):
     site = SITES[site_key]
 
     if isinstance(site, Kai):
-        u = await asyncio.to_thread(site.mapper_file, ep, height, kind)
+        mf = (getattr(site, "mapper_file", None)
+              or getattr(site, "mapper_file_sync", None))
+        u = None
+        if mf:
+            try:
+                u = await asyncio.to_thread(mf, ep, height, kind)
+            except Exception:
+                u = None
         if u:
             return u
         short = await asyncio.to_thread(site.short_link, ep, height, kind)
