@@ -283,6 +283,35 @@ class Kai(Site):
         ok = [k for k in t if _q(k) <= height]
         return t[max(ok, key=_q) if ok else min(t, key=_q)]
 
+    def mapper_file(self, ep, height, kind):
+        pick = self.short_link(ep, height, kind)
+        if not pick:
+            return None
+        m = re.search(r"/([A-Za-z0-9]+)/?$", pick)
+        if not m:
+            return None
+        fid = m.group(1)
+        nav = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+               "Sec-Fetch-Site": "cross-site",
+               "Upgrade-Insecure-Requests": "1"}
+        tries = [
+            (f"https://testpahe.nekostream.site/{fid}", pick, nav),
+            (f"https://testpahe.nekostream.site/{fid}", pick, None),
+            (f"https://testpahe.nekostream.site/{fid}",
+             "https://pahe.nekostream.site/", None),
+            (f"https://pahe.nekostream.site/{fid}", pick, None),
+        ]
+        for url, ref, extra in tries:
+            try:
+                rr = http_get(url, ref=ref, extra=extra)
+            except Exception:
+                continue
+            ct = rr.headers.get("content-type", "").lower()
+            if rr.status_code == 200 and any(
+                    x in ct for x in ("video", "octet", "mpeg", "matroska", "mp4")):
+                return rr.url
+        return None
+
     async def browser_file(self, short_url):
         b = await _get_browser()
         ctx = await b.new_context(user_agent=UA, locale="en-US")
@@ -311,26 +340,31 @@ class Kai(Site):
                 await page.wait_for_timeout(2500)
 
             if "kwik.cx" in page.url:
-                for _ in range(2):
+                try:
+                    u = await self.kwik_mp4(page)
+                except Exception:
+                    u = None
+                if u:
+                    found.append(u)
+                if not found:
                     for sel in ("#btn-download", "button.btn", "a.btn", "button"):
                         try:
                             await page.click(sel, timeout=3000)
                             break
                         except Exception:
                             continue
-                    for _ in range(30):
+                    for _ in range(36):
                         if found:
                             break
                         await page.wait_for_timeout(500)
-                    if found:
-                        break
-                try:
-                    html = await page.content()
-                    for m in re.findall(
-                            r'https?://[^"\'\\\s]+?\.mp4[^"\'\\\s]*', html):
-                        found.append(m.replace("\\/", "/"))
-                except Exception:
-                    pass
+                if not found:
+                    try:
+                        html = await page.content()
+                        for m in re.findall(
+                                r'https?://[^"\'\\\s]+?\.mp4[^"\'\\\s]*', html):
+                            found.append(m.replace("\\/", "/"))
+                    except Exception:
+                        pass
 
             final = found[0] if found else page.url
             ck = await ctx.cookies()
@@ -338,6 +372,44 @@ class Kai(Site):
             return final, cookie
         finally:
             await ctx.close()
+
+    async def kwik_mp4(self, page):
+        info = await page.evaluate("""() => {
+            const f = document.querySelector('form');
+            if (!f) return null;
+            const d = {};
+            new FormData(f).forEach((v, k) => { d[k] = v; });
+            return {action: f.getAttribute('action') || location.pathname,
+                    data: d};
+        }""")
+        if not info:
+            return None
+        body = "&".join(f"{urllib.parse.quote(k)}={urllib.parse.quote(v)}"
+                        for k, v in info["data"].items())
+        txt = await page.evaluate(
+            """async ([action, body]) => {
+                const r = await fetch(action, {method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: body});
+                return await r.text();
+            }""", [info["action"], body])
+        if not txt:
+            return None
+
+        cand = re.findall(r'https?://[^"\'\\\s|]+?\.mp4[^"\'\\\s|]*', txt)
+        if cand:
+            return cand[0].replace("\\/", "/")
+
+        for b64 in re.findall(r'[A-Za-z0-9+/]{60,}={0,2}', txt):
+            try:
+                dec = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode(
+                    "utf-8", "ignore")
+            except Exception:
+                continue
+            m = re.search(r'https?://[^"\'\\\s]+?\.mp4[^"\'\\\s]*', dec)
+            if m:
+                return m.group(0).replace("\\/", "/")
+        return None
 
     def ajax_source(self, ep_url, kind):
         try:
@@ -415,11 +487,6 @@ class WCO(Site):
             if m:
                 out.append({"num": m.group(1),
                             "url": urllib.parse.urljoin(self.base, a["href"])})
-        if not out:
-            m = re.search(r'"episode"\s*:\s*(\d+)', html or "")
-            if m:
-                for i in range(1, int(m.group(1)) + 1):
-                    out.append({"num": str(i), "url": url})
         out.sort(key=lambda x: int(x["num"]))
         return _dedup(out)
 
@@ -557,6 +624,7 @@ async def resolve_one(site_key, ep, kind, height=720):
                 u = None
         if u:
             return u
+
         short = await asyncio.to_thread(site.short_link, ep, height, kind)
         if short:
             try:
@@ -572,6 +640,7 @@ async def resolve_one(site_key, ep, kind, height=720):
                                    "Referer": "https://kwik.cx/",
                                    "Origin": "https://kwik.cx"}
                     return final
+
         u = await asyncio.to_thread(site.ajax_source, ep["url"], kind)
         if u and any(x in u for x in (".m3u8", ".mp4", ".mkv")):
             return u
@@ -579,6 +648,7 @@ async def resolve_one(site_key, ep, kind, height=720):
             got = await generic_resolve(u, ep["url"])
             if got:
                 return got
+
         sel = ("#w-servers .type[data-type='dub'] li" if kind == "dub"
                else "#w-servers .type[data-type='sub'] li")
         got = await generic_resolve(ep["url"], ep["url"], click=sel)
@@ -633,15 +703,13 @@ async def debug_ep(ep, kind, height):
     except Exception as e:
         L.append(f"جدول خطا: {type(e).__name__} {e}")
 
+    short = None
     try:
         short = await asyncio.to_thread(
             SITES["anikoto"].short_link, ep, height, kind)
         L.append(f"short: {short}")
-        if short:
-            final, ck = await SITES["anikoto"].browser_file(short)
-            L.append(f"browser: {final[:120]} cookie={len(ck)}")
     except Exception as e:
-        L.append(f"browser خطا: {type(e).__name__} {e}")
+        L.append(f"short خطا: {type(e).__name__} {e}")
 
     try:
         u = await asyncio.to_thread(
@@ -649,6 +717,34 @@ async def debug_ep(ep, kind, height):
         L.append(f"ajax_server: {u}")
     except Exception as e:
         L.append(f"ajax خطا: {type(e).__name__}")
+
+    if short:
+        b = await _get_browser()
+        ctx = await b.new_context(user_agent=UA, locale="en-US")
+        pg = await ctx.new_page()
+        try:
+            await pg.goto(short, referer="https://pahe.nekostream.site/",
+                          wait_until="domcontentloaded", timeout=45000)
+            await pg.wait_for_timeout(3500)
+            if "pahe." in pg.url:
+                for sel in ("button.btn", "button"):
+                    try:
+                        await pg.click(sel, timeout=3000)
+                        break
+                    except Exception:
+                        continue
+                await pg.wait_for_timeout(2500)
+            L.append(f"landed: {pg.url[:90]}")
+            if "kwik.cx" in pg.url:
+                got = await SITES["anikoto"].kwik_mp4(pg)
+                L.append(f"kwik_mp4: {str(got)[:110]}")
+                if not got:
+                    body = await pg.evaluate("() => document.body.innerText")
+                    L.append("page: " + " ".join((body or "").split())[:180])
+        except Exception as e:
+            L.append(f"browser خطا: {type(e).__name__} {e}")
+        finally:
+            await ctx.close()
 
     return "\n".join(L)
 
