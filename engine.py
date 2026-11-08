@@ -9,6 +9,7 @@ MAPPER = "https://mapper.nekostream.site/api/mal/"
 
 _cookies = {}
 HDRS = {}
+WLIST = {}
 
 
 def _headers(ref=None):
@@ -86,6 +87,13 @@ async def _get_browser():
     return _browser
 
 
+async def _call(fn, *a):
+    r = fn(*a)
+    if asyncio.iscoroutine(r):
+        return await r
+    return r
+
+
 async def warm(base):
     try:
         b = await _get_browser()
@@ -103,6 +111,33 @@ async def warm(base):
 
 async def warm_all():
     await asyncio.gather(*[warm(s.base) for s in SITES.values()])
+
+
+async def js_html(url, wait_ms=6000, ref=None):
+    b = await _get_browser()
+    hdr = {"Referer": ref} if ref else {}
+    ctx = await b.new_context(user_agent=UA, locale="en-US",
+                              extra_http_headers=hdr)
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(wait_ms)
+        return await page.content()
+    finally:
+        await ctx.close()
+
+
+async def _fetch(url, ref=None):
+    try:
+        r = await asyncio.to_thread(lambda: http_get(url, ref))
+        if r.status_code == 200 and len(r.text) > 2000:
+            return r.text
+    except Exception:
+        pass
+    try:
+        return await js_html(url, 5000, ref)
+    except Exception:
+        return ""
 
 
 async def js_capture(url, ref=None, click=None, wait_ms=12000):
@@ -149,18 +184,6 @@ async def js_capture(url, ref=None, click=None, wait_ms=12000):
     return list(dict.fromkeys(found))
 
 
-async def js_html(url, wait_ms=7000):
-    b = await _get_browser()
-    ctx = await b.new_context(user_agent=UA, locale="en-US")
-    page = await ctx.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(wait_ms)
-        return await page.content()
-    finally:
-        await ctx.close()
-
-
 def _best(urls):
     if not urls:
         return None
@@ -200,7 +223,7 @@ class Site:
 
 
 class Kai(Site):
-    """خانوادهٔ animekai/anikoto/aniwave"""
+    """خانوادهٔ animekai/anikoto/aniwave + kwik"""
 
     def search(self, q):
         r = http_get(f"{self.base}/filter?keyword={urllib.parse.quote(q)}")
@@ -260,46 +283,44 @@ class Kai(Site):
         ok = [k for k in t if _q(k) <= height]
         return t[max(ok, key=_q) if ok else min(t, key=_q)]
 
-    def mapper_file(self, ep, height, kind):
-        pick = self.short_link(ep, height, kind)
-        if not pick:
-            return None
-        m = re.search(r"/([A-Za-z0-9]+)/?$", pick)
-        if not m:
-            return None
-        fid = m.group(1)
-        nav = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
-               "Sec-Fetch-Site": "cross-site",
-               "Upgrade-Insecure-Requests": "1"}
-        tries = [
-            (f"https://testpahe.nekostream.site/{fid}", pick, nav),
-            (f"https://testpahe.nekostream.site/{fid}", pick, None),
-            (f"https://testpahe.nekostream.site/{fid}",
-             "https://pahe.nekostream.site/", None),
-            (f"https://pahe.nekostream.site/{fid}", pick, None),
-        ]
-        for url, ref, extra in tries:
-            try:
-                rr = http_get(url, ref=ref, extra=extra)
-            except Exception:
-                continue
-            ct = rr.headers.get("content-type", "").lower()
-            if rr.status_code == 200 and any(
-                    x in ct for x in ("video", "octet", "mpeg", "matroska", "mp4")):
-                return rr.url
-        return None
-
     async def browser_file(self, short_url):
+        """pahe → testpahe → kwik، و گرفتن mp4 واقعی"""
         b = await _get_browser()
         ctx = await b.new_context(user_agent=UA, locale="en-US")
         page = await ctx.new_page()
+        found = []
+
+        def on_req(req):
+            if ".mp4" in req.url:
+                found.append(req.url)
+
+        page.on("request", on_req)
         try:
-            fid = short_url.rstrip("/").rsplit("/", 1)[-1]
-            await page.goto(f"https://testpahe.nekostream.site/{fid}",
-                            referer="https://pahe.nekostream.site/",
+            await page.goto(short_url, referer="https://pahe.nekostream.site/",
                             wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(2500)
-            final = page.url
+            await page.wait_for_timeout(1500)
+
+            if "kwik.cx" in page.url:
+                for sel in ("#btn-download", "button.btn", "a.btn",
+                            "button", ".download"):
+                    try:
+                        await page.click(sel, timeout=4000)
+                        break
+                    except Exception:
+                        continue
+                for _ in range(36):
+                    if found:
+                        break
+                    await page.wait_for_timeout(500)
+                try:
+                    html = await page.content()
+                    for m in re.findall(
+                            r'https?://[^"\'\\\s]+?\.mp4[^"\'\\\s]*', html):
+                        found.append(m.replace("\\/", "/"))
+                except Exception:
+                    pass
+
+            final = found[0] if found else page.url
             ck = await ctx.cookies()
             cookie = "; ".join(f"{c['name']}={c['value']}" for c in ck)
             return final, cookie
@@ -334,72 +355,89 @@ class Kai(Site):
                 continue
         return None
 
-    def kinds(self, ep_url):
-        try:
-            html = http_get(ep_url).text
-        except Exception:
-            return set()
-        soup = BeautifulSoup(html, "lxml")
-        out = set()
-        for d in soup.select("#w-servers .type[data-type]"):
-            if d.select("li[data-link-id]"):
-                out.add(d.get("data-type"))
-        return out
-
 
 class WCO(Site):
-    def search(self, q):
-        for path in ("/search?query=", "/?s="):
-            try:
-                r = http_get(self.base + path + urllib.parse.quote(q))
-            except Exception:
+    async def _list(self):
+        if self.key in WLIST:
+            return WLIST[self.key]
+        url = self.base + ("/dubbed-anime-list" if "dub" in self.key
+                           else "/subbed-anime-list")
+        html = await _fetch(url)
+        soup = BeautifulSoup(html or "", "lxml")
+        out = []
+        for a in soup.select("a[href*='/anime/']"):
+            t = a.get_text(" ", strip=True)
+            if len(t) < 2:
                 continue
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.text, "lxml")
-            out = []
-            for a in soup.select("a[href]"):
-                href = a["href"]
-                if "episode" in href or href.count("/") > 4:
-                    continue
-                title = a.get("title") or a.get_text(" ", strip=True)
-                if len(title) < 3:
-                    continue
-                out.append({"title": title,
-                            "url": urllib.parse.urljoin(self.base, href),
-                            "site": self.key})
-            out = _dedup(out)
-            if out:
-                return out[:12]
-        return []
+            out.append({"title": t,
+                        "url": urllib.parse.urljoin(self.base, a["href"]),
+                        "site": self.key})
+        WLIST[self.key] = _dedup(out)
+        return WLIST[self.key]
 
-    def episodes(self, url):
-        html = http_get(url).text
-        soup = BeautifulSoup(html, "lxml")
+    async def search(self, q):
+        n = q.lower().strip()
+        if not n:
+            return []
+        items = await self._list()
+        if not items:
+            html = await _fetch(
+                f"{self.base}/search?query={urllib.parse.quote(q)}")
+            soup = BeautifulSoup(html or "", "lxml")
+            for a in soup.select("a[href*='/anime/']"):
+                t = a.get_text(" ", strip=True)
+                if len(t) > 2:
+                    items.append({"title": t,
+                                  "url": urllib.parse.urljoin(self.base, a["href"]),
+                                  "site": self.key})
+        hit = [i for i in items if n in i["title"].lower()]
+        hit.sort(key=lambda x: len(x["title"]))
+        return hit[:10]
+
+    async def episodes(self, url):
+        html = await _fetch(url)
+        soup = BeautifulSoup(html or "", "lxml")
         out = []
         for a in soup.select("a[href]"):
             m = re.search(r"episode[-/]?(\d+)", a["href"])
             if m:
                 out.append({"num": m.group(1),
                             "url": urllib.parse.urljoin(self.base, a["href"])})
+        if not out:
+            m = re.search(r'"episode"\s*:\s*(\d+)', html or "")
+            if m:
+                for i in range(1, int(m.group(1)) + 1):
+                    out.append({"num": str(i), "url": url})
         out.sort(key=lambda x: int(x["num"]))
         return _dedup(out)
 
-    def kinds(self, ep_url):
-        return {"sub", "dub"}
-
-    def resolve(self, ep_url):
-        html = http_get(ep_url).text
-        m = re.search(r'data-apireq="([^"]+)"', html)
+    async def resolve(self, ep_url):
+        html = await _fetch(ep_url)
+        m = re.search(r'data-apireq="([^"]+)"', html or "")
         if not m:
             return None
-        r = http_post(self.base + "/inc/embed/getvidlink.php",
-                      {"data": m.group(1)}, ref=ep_url)
+        data = m.group(1)
+        b = await _get_browser()
+        ctx = await b.new_context(user_agent=UA, locale="en-US")
+        page = await ctx.new_page()
         try:
-            j = r.json()
+            await page.goto(ep_url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2000)
+            res = await page.evaluate(
+                """async (d) => {
+                    const r = await fetch('/inc/embed/getvidlink.php',
+                        {method:'POST',
+                         headers:{'Content-Type':'application/x-www-form-urlencoded',
+                                  'X-Requested-With':'XMLHttpRequest'},
+                         body:'data=' + encodeURIComponent(d)});
+                    return await r.text();
+                }""", data)
+            j = json.loads(res)
+            return j.get("file") or j.get("url")
         except Exception:
             return None
-        return j.get("file") or j.get("url")
+        finally:
+            await ctx.close()
 
 
 SITES = {}
@@ -423,11 +461,11 @@ class AniWaveBy(Kai):
 
 
 class WcoDub(WCO):
-    key, name, base = "wcodub", "WCO (Dub)", "https://wcoanimedub.tv"
+    key, name, base = "wcodub", "WCO (Dub)", "https://www.wcoanimedub.tv"
 
 
 class WcoSub(WCO):
-    key, name, base = "wcosub", "WCO (Sub)", "https://wcoanimesub.tv"
+    key, name, base = "wcosub", "WCO (Sub)", "https://www.wcoanimesub.tv"
 
 
 for c in (AniKoto, AniWaves, AniWaveBy, WcoDub, WcoSub):
@@ -444,7 +482,7 @@ async def search_all(query):
     async def one(site):
         for attempt in range(2):
             try:
-                return await asyncio.to_thread(site.search, query)
+                return await _call(site.search, query) or []
             except Exception:
                 if attempt == 0:
                     await warm(site.base)
@@ -467,7 +505,7 @@ async def get_episodes(site_key, url):
     site = SITES[site_key]
     if not isinstance(site, Kai):
         try:
-            return await asyncio.to_thread(site.episodes, url), ""
+            return await _call(site.episodes, url), ""
         except Exception as e:
             return [], f"خطا: {e}"
 
@@ -507,11 +545,13 @@ async def resolve_one(site_key, ep, kind, height=720):
             except Exception:
                 final, cookie = None, ""
             if final and final != short:
-                ok = await asyncio.to_thread(_is_media, final)
+                ok = True
+                if not re.search(r"\.(mp4|mkv|m3u8)(\?|$)", final):
+                    ok = await asyncio.to_thread(_is_media, final)
                 if ok:
-                    if cookie:
-                        HDRS[final] = {"Cookie": cookie,
-                                       "Referer": "https://pahe.nekostream.site/"}
+                    HDRS[final] = {"Cookie": cookie,
+                                   "Referer": "https://kwik.cx/",
+                                   "Origin": "https://kwik.cx"}
                     return final
         u = await asyncio.to_thread(site.ajax_source, ep["url"], kind)
         if u and any(x in u for x in (".m3u8", ".mp4", ".mkv")):
@@ -526,7 +566,7 @@ async def resolve_one(site_key, ep, kind, height=720):
         return got or await generic_resolve(ep["url"], ep["url"])
 
     try:
-        u = await asyncio.to_thread(site.resolve, ep["url"])
+        u = await _call(site.resolve, ep["url"])
     except Exception:
         u = None
     if u and any(x in u for x in (".m3u8", ".mp4", ".mkv")):
@@ -547,14 +587,14 @@ async def resolve(job, ep, kind, height=720):
         if sk == job["site"]:
             continue
         try:
-            res = await asyncio.to_thread(site.search, job["title"])
+            res = await _call(site.search, job["title"]) or []
         except Exception:
             continue
         hit = next((r for r in res if norm(r["title"])[:22] == key[:22]), None)
         if not hit:
             continue
         try:
-            eps = await asyncio.to_thread(site.episodes, hit["url"])
+            eps = await _call(site.episodes, hit["url"])
         except Exception:
             continue
         e2 = next((e for e in eps if e["num"] == ep["num"]), None)
@@ -569,15 +609,6 @@ async def resolve(job, ep, kind, height=720):
 async def debug_ep(ep, kind, height):
     L = [f"mal={ep.get('mal')} slug={ep.get('slug')} ts={ep.get('ts')}"]
     try:
-        html = await asyncio.to_thread(lambda: http_get(ep["url"]).text)
-        L.append(f"صفحه: {len(html)} کاراکتر، w-servers={'#w-servers' in html}")
-        soup = BeautifulSoup(html, "lxml")
-        lis = soup.select("#w-servers li[data-link-id]")
-        L.append(f"تعداد li سرور: {len(lis)}")
-    except Exception as e:
-        L.append(f"صفحه خطا: {type(e).__name__} {e}")
-
-    try:
         t = await asyncio.to_thread(SITES["anikoto"]._table, ep, kind)
         L.append(f"جدول دانلود: {json.dumps(t)[:250] if t else 'خالی'}")
     except Exception as e:
@@ -589,9 +620,7 @@ async def debug_ep(ep, kind, height):
         L.append(f"short: {short}")
         if short:
             final, ck = await SITES["anikoto"].browser_file(short)
-            L.append(f"browser: {final[:110]} cookie={len(ck)}")
-            ok = await asyncio.to_thread(_is_media, final)
-            L.append(f"media? {ok}")
+            L.append(f"browser: {final[:120]} cookie={len(ck)}")
     except Exception as e:
         L.append(f"browser خطا: {type(e).__name__} {e}")
 
@@ -602,18 +631,18 @@ async def debug_ep(ep, kind, height):
     except Exception as e:
         L.append(f"ajax خطا: {type(e).__name__}")
 
-    try:
-        found = await js_capture(ep["url"], ep["url"], wait_ms=15000)
-        L.append(f"capture: {len(found)} {found[:2]}")
-    except Exception as e:
-        L.append(f"capture خطا: {type(e).__name__}")
-
     return "\n".join(L)
 
 
 def download(url, ref, kind, height, outdir, on_progress=None):
     os.makedirs(outdir, exist_ok=True)
     tmpl = os.path.join(outdir, "ep.%(ext)s")
+    hdrs = {}
+    if ref:
+        hdrs["Referer"] = ref
+        hdrs["Origin"] = origin(ref)
+    hdrs.update(HDRS.get(url, {}))
+
     cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
            "--newline", "--retries", "5", "--fragment-retries", "20",
            "--concurrent-fragments", "8", "--no-check-certificates",
@@ -621,9 +650,7 @@ def download(url, ref, kind, height, outdir, on_progress=None):
            "-f", f"bv*[height<={height}]+ba/b[height<={height}]/b",
            "--merge-output-format", "mp4", "--remux-video", "mp4",
            "-o", tmpl]
-    if ref:
-        cmd += ["--referer", ref, "--add-header", f"Origin:{origin(ref)}"]
-    for k, v in HDRS.get(url, {}).items():
+    for k, v in hdrs.items():
         cmd += ["--add-header", f"{k}: {v}"]
     if kind == "sub":
         cmd += ["--write-subs", "--write-auto-subs",
@@ -647,10 +674,8 @@ def download(url, ref, kind, height, outdir, on_progress=None):
 
     if rc != 0:
         out = os.path.join(outdir, "ep.mp4")
-        hdrs = f"Referer: {ref}\r\n"
-        for k, v in HDRS.get(url, {}).items():
-            hdrs += f"{k}: {v}\r\n"
-        r2 = subprocess.run(["ffmpeg", "-y", "-headers", hdrs,
+        hl = "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
+        r2 = subprocess.run(["ffmpeg", "-y", "-headers", hl,
                              "-i", url, "-c", "copy", out],
                             capture_output=True, text=True)
         if r2.returncode != 0:
