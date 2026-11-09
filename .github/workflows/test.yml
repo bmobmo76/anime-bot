@@ -12,5 +12,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -q curl_cffi cryptography
+      - run: pip install -q curl_cffi cryptography yt-dlp
       - run: python dump_page.py
