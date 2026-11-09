@@ -13,4 +13,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q curl_cffi cryptography yt-dlp
-      - run: python dump_page.py
+      - run: python find_crypto.py
