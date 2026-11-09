@@ -10,8 +10,9 @@ Public API:
     episodes(show_id, kind)           -> list of ints
     resolve(show_id, episode, kind)   -> (mp4_url, referer)
     health()                          -> dict for /debug
+    probe(show_id, episode, kind)     -> diagnostics dict
 
-CLI self-test:
+CLI:
     python allanime.py "blue box" 2 sub
 """
 
@@ -20,12 +21,16 @@ import hashlib
 import json
 import re
 import time
-from urllib.parse import urljoin
 
 from curl_cffi import requests as creq
 
 API = "https://api.allanime.day/api"
-SITE = "https://mkissa.to"
+HOSTS = [
+    "https://mkissa.to",
+    "https://allanime.day",
+    "https://youtu-chan.com",
+    "https://allmanga.to",
+]
 ORIGIN = "https://youtu-chan.com"
 MASK = "b1a9a4d051988f1b1b12dbb747439d9bd64b09ea17835600a7eaa4de87c1ad87"
 
@@ -48,6 +53,10 @@ SEARCH_QUERY = (
     '{edges{_id name availableEpisodes thumbnail}}'
     '}'
 )
+
+RE_EPOCH = re.compile(r'epoch["\']?\s*[:=]\s*["\']?(\d{3,})')
+RE_PARTB = re.compile(r'partB["\']?\s*[:=]\s*["\']([A-Za-z0-9+/=]{20,})["\']')
+RE_BUILD = re.compile(r'buildId["\']?\s*[:=]\s*["\']?(\d{1,4})')
 
 CIPHER = {
     0x79: "A", 0x7A: "B", 0x7B: "C", 0x7C: "D", 0x7D: "E", 0x7E: "F", 0x7F: "G",
@@ -74,10 +83,7 @@ def _sess():
 
 
 def _decipher(url):
-    """Decode an obfuscated '--xxxx' AllAnime URL."""
-    if not url:
-        return url
-    if not url.startswith("--"):
+    if not url or not url.startswith("--"):
         return url
     body = url[2:]
     out = []
@@ -97,8 +103,7 @@ def _xor_key(part_b):
 
 def _aes_gcm_encrypt(key, iv, plain):
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    ct = AESGCM(key).encrypt(iv, plain, None)
-    return ct
+    return AESGCM(key).encrypt(iv, plain, None)
 
 
 def _aes_ctr_decrypt(key, iv, data):
@@ -108,48 +113,87 @@ def _aes_ctr_decrypt(key, iv, data):
 
 
 def _decrypt_blob(key, blob):
-    """Best-effort decrypt of the 'tobeparsed' field. Returns str or None."""
     try:
         raw = base64.b64decode(blob)
     except Exception:
         return None
-    attempts = []
-    if raw[:1] == b"\x01" and len(raw) > 13:
-        attempts.append(raw[1:13])
-        attempts.append(raw[1:17])
-    if len(raw) > 12:
-        attempts.append(raw[:12])
-        attempts.append(raw[:16])
-    for ivlen in (12, 16):
-        iv = (hashlib.sha256(key).digest()[:ivlen])
-        attempts.append(iv)
-    for iv in attempts:
+    candidates = []
+    if raw[:1] == b"\x01" and len(raw) > 17:
+        candidates.append((raw[1:13], raw[13:]))
+        candidates.append((raw[1:17], raw[17:]))
+    if len(raw) > 16:
+        candidates.append((raw[:12], raw[12:]))
+        candidates.append((raw[:16], raw[16:]))
+    candidates.append((hashlib.sha256(key).digest()[:12], raw))
+    for iv, body in candidates:
         if len(iv) not in (12, 16):
             continue
-        body = raw[1 + len(iv):] if raw[:1] == b"\x01" else raw[len(iv):]
         try:
-            out = _aes_ctr_decrypt(key, iv, body)
-            txt = out.decode("utf-8", "ignore").strip()
-            if txt.startswith("{") or '"sourceUrls"' in txt:
-                return txt
+            txt = _aes_ctr_decrypt(key, iv, body).decode("utf-8", "ignore").strip()
         except Exception:
             continue
+        if "sourceUrls" in txt or txt.startswith("{"):
+            return txt
     return None
 
 
+def _crypto_urls(show_id, episode, kind):
+    paths = [
+        f"/watch/{show_id}/p-{episode}-{kind}",
+        f"/watch/{show_id}/p-{episode}",
+        f"/anime/{show_id}/{kind}-{episode}",
+    ]
+    for host in HOSTS:
+        for path in paths:
+            yield host + path
+
+
+def probe(show_id, episode, kind="sub"):
+    """Diagnostics: what do the episode pages actually return?"""
+    sess = _sess()
+    report = []
+    for url in _crypto_urls(show_id, episode, kind):
+        item = {"url": url}
+        try:
+            r = sess.get(url, timeout=30, allow_redirects=True)
+            html = r.text or ""
+            item["status"] = r.status_code
+            item["len"] = len(html)
+            item["final"] = str(r.url)
+            e = RE_EPOCH.search(html)
+            p = RE_PARTB.search(html)
+            item["epoch"] = e.group(1) if e else None
+            item["partB"] = (p.group(1)[:16] + "...") if p else None
+            item["has_aaCrypto"] = "__aaCrypto" in html
+            if not p:
+                item["head"] = html[:300].replace("\n", " ")
+        except Exception as exc:
+            item["error"] = f"{type(exc).__name__}: {exc}"
+        report.append(item)
+        if item.get("partB"):
+            break
+    return report
+
+
 def _page_crypto(sess, show_id, episode, kind):
-    """Scrape __aaCrypto (epoch/partB/buildId) from the episode page."""
-    url = f"{SITE}/watch/{show_id}/p-{episode}-{kind}"
-    r = sess.get(url, timeout=45)
-    html = r.text or ""
-    if r.status_code != 200:
-        raise RuntimeError(f"crypto page HTTP {r.status_code}")
-    epoch = re.search(r'"epoch"\s*:\s*(\d+)', html)
-    part_b = re.search(r'"partB"\s*:\s*"([^"]+)"', html)
-    build = re.search(r'"buildId"\s*:\s*"?(\d+)"?', html)
-    if not epoch or not part_b:
-        raise RuntimeError("__aaCrypto not found on page")
-    return epoch.group(1), part_b.group(1), (build.group(1) if build else None)
+    tried = []
+    for url in _crypto_urls(show_id, episode, kind):
+        try:
+            r = sess.get(url, timeout=30)
+        except Exception as exc:
+            tried.append(f"{url} -> {type(exc).__name__}")
+            continue
+        html = r.text or ""
+        if r.status_code != 200:
+            tried.append(f"{url} -> HTTP {r.status_code}")
+            continue
+        e = RE_EPOCH.search(html)
+        p = RE_PARTB.search(html)
+        if e and p:
+            b = RE_BUILD.search(html)
+            return e.group(1), p.group(1), (b.group(1) if b else None)
+        tried.append(f"{url} -> 200 but no crypto ({len(html)}b)")
+    raise RuntimeError("__aaCrypto not found: " + "; ".join(tried[:4]))
 
 
 def _signed_request(sess, show_id, episode, kind):
@@ -167,7 +211,9 @@ def _signed_request(sess, show_id, episode, kind):
             {"v": 1, "ts": ts, "epoch": int(epoch), "buildId": b, "qh": EP_QH},
             separators=(",", ":"),
         ).encode()
-        aa_req = base64.b64encode(b"\x01" + iv + _aes_gcm_encrypt(key, iv, payload)).decode()
+        aa_req = base64.b64encode(
+            b"\x01" + iv + _aes_gcm_encrypt(key, iv, payload)
+        ).decode()
         body = {
             "variables": {
                 "showId": show_id,
@@ -191,16 +237,17 @@ def _signed_request(sess, show_id, episode, kind):
             return ep, key
         err = data.get("errors") or [{}]
         last = err[0].get("message", f"HTTP {r.status_code}")
+        if "CAPTCHA" in last.upper():
+            break
     raise RuntimeError(f"episode query failed: {last}")
 
 
 def _sources(ep, key):
-    """Return [(name, url)] from an episode payload, decrypting if needed."""
     if isinstance(ep, dict) and isinstance(ep.get("sourceUrls"), list):
         return [(s.get("sourceName", ""), s.get("sourceUrl", "")) for s in ep["sourceUrls"]]
     blob = None
     if isinstance(ep, dict):
-        for k in ("tobeparsed", "toBeParsed", "encrypted"):
+        for k in ("tobeparsed", "toBeParsed", "encrypted", "data"):
             if isinstance(ep.get(k), str):
                 blob = ep[k]
                 break
@@ -217,27 +264,20 @@ def _sources(ep, key):
         obj = obj["sourceUrls"]
     if not isinstance(obj, list):
         return []
-    out = []
-    for s in obj:
-        if isinstance(s, dict):
-            out.append((s.get("sourceName", ""), s.get("sourceUrl", "")))
-    return out
+    return [(s.get("sourceName", ""), s.get("sourceUrl", ""))
+            for s in obj if isinstance(s, dict)]
 
 
 def _clock(sess, url):
-    """Resolve an /apivtwo/ or /apiv2/ clock endpoint to a direct mp4."""
     r = sess.get(url, timeout=60, headers={"Referer": ORIGIN + "/"})
     try:
         data = r.json()
     except Exception:
         return None
-    links = data.get("links") or []
     best = None
-    for ln in links:
+    for ln in data.get("links") or []:
         link = ln.get("link") or ""
-        if not link.startswith("http"):
-            continue
-        if ".m3u8" in link:
+        if not link.startswith("http") or ".m3u8" in link:
             continue
         try:
             res = int(ln.get("resolutionStr") or ln.get("resolution") or 0)
@@ -256,8 +296,7 @@ def search(query, limit=25):
     }
     r = sess.post(API, data=json.dumps(body),
                   headers={"Content-Type": "application/json"}, timeout=45)
-    data = r.json()
-    edges = (((data.get("data") or {}).get("shows") or {}).get("edges")) or []
+    edges = (((r.json().get("data") or {}).get("shows") or {}).get("edges")) or []
     out = []
     for e in edges:
         av = e.get("availableEpisodes") or {}
@@ -283,8 +322,7 @@ def episodes(show_id, kind="sub"):
     if not edges:
         return []
     av = edges[0].get("availableEpisodes") or {}
-    n = int(av.get(kind) or 0)
-    return list(range(1, n + 1))
+    return list(range(1, int(av.get(kind) or 0) + 1))
 
 
 def resolve(show_id, episode, kind="sub"):
@@ -295,7 +333,7 @@ def resolve(show_id, episode, kind="sub"):
         raise RuntimeError("no sourceUrls")
 
     direct, clock = [], []
-    for name, raw in srcs:
+    for _name, raw in srcs:
         url = _decipher(raw)
         if not url.startswith("http"):
             continue
@@ -317,7 +355,7 @@ def resolve(show_id, episode, kind="sub"):
 def health():
     try:
         res = search("blue box", limit=3)
-        return {"ok": bool(res), "results": len(res), "sample": res[:1]}
+        return {"ok": bool(res), "results": len(res)}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -327,15 +365,17 @@ if __name__ == "__main__":
     q = sys.argv[1] if len(sys.argv) > 1 else "blue box"
     ep_no = sys.argv[2] if len(sys.argv) > 2 else "2"
     kind = sys.argv[3] if len(sys.argv) > 3 else "sub"
-    print("health:", json.dumps(health(), ensure_ascii=False)[:400])
+    print("health:", json.dumps(health(), ensure_ascii=False))
     hits = search(q)
-    print("search:", json.dumps(hits[:3], ensure_ascii=False))
+    print("search:", json.dumps(hits[:2], ensure_ascii=False))
     if hits:
         target = hits[0]
-        print("show:", target["id"], target["name"], "sub", target["sub"], "dub", target["dub"])
+        print("show:", target["id"], target["name"])
+        print("PROBE:")
+        for row in probe(target["id"], ep_no, kind):
+            print("  ", json.dumps(row, ensure_ascii=False)[:400])
         try:
             url, ref = resolve(target["id"], ep_no, kind)
             print("mp4:", url)
-            print("referer:", ref)
         except Exception as exc:
             print("resolve failed:", type(exc).__name__, exc)
