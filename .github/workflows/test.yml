@@ -13,4 +13,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q curl_cffi cryptography
-      - run: python allanime.py "blue box" 2 sub
+      - run: python dump_page.py
