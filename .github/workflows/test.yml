@@ -13,4 +13,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q curl_cffi cryptography yt-dlp anipy-api
-      - run: python probe3.py
+      - run: python allanime.py "blue box" 2 sub
