@@ -1,70 +1,79 @@
 import inspect
 import traceback
 
+import anipy_api
+from anipy_api.provider import get_provider, list_providers
 
-def show(title, fn):
-    print("\n===", title, "===")
-    try:
-        out = fn()
-        print("OK:", repr(out)[:800])
-        return out
-    except Exception as exc:
-        print("FAIL:", type(exc).__name__, exc)
-        traceback.print_exc(limit=2)
-        return None
+print("version:", getattr(anipy_api, "__version__", "?"))
 
-
+print("\n=== get_provider signature ===")
 try:
-    import anipy_api
-    from anipy_api.provider import get_provider, list_providers
-except Exception:
-    print("anipy_api import failed")
-    traceback.print_exc()
-    raise SystemExit(1)
+    print(inspect.signature(get_provider))
+except Exception as exc:
+    print("sig err", exc)
+try:
+    print(inspect.getsource(get_provider)[:1200])
+except Exception as exc:
+    print("src err", exc)
 
-print("anipy_api version:", getattr(anipy_api, "__version__", "?"))
+print("\n=== providers ===")
+for cls in list_providers():
+    print("\n---", cls.__name__)
+    try:
+        print("module:", cls.__module__)
+        print("sig:", inspect.signature(cls))
+    except Exception as exc:
+        print("sig err", exc)
+    try:
+        print("init src:", inspect.getsource(cls.__init__)[:700])
+    except Exception as exc:
+        print("src err", exc)
 
-provs = show("list_providers", lambda: list(list_providers()))
-print("providers sample:", str(provs)[:400])
+print("\n=== provider base ===")
+try:
+    from anipy_api.provider.base import Provider
+    print([m for m in dir(Provider) if not m.startswith("_")])
+    for name in ("get_search_results", "get_episodes", "get_video", "get_info"):
+        fn = getattr(Provider, name, None)
+        if fn:
+            try:
+                print(name, inspect.signature(fn))
+            except Exception:
+                pass
+except Exception as exc:
+    print("base err", exc)
 
-prov = None
-for name in ("AllAnime", "allanime"):
-    prov = show("get_provider " + name, lambda n=name: get_provider(n))
-    if prov:
-        break
+print("\n=== LanguageTypeEnum ===")
+try:
+    from anipy_api.provider import LanguageTypeEnum
+    print(list(LanguageTypeEnum))
+except Exception as exc:
+    print("enum err", exc)
 
-if not prov:
-    raise SystemExit(1)
-
-print("\nprovider type:", type(prov))
-print("methods:", [m for m in dir(prov) if not m.startswith("_")])
-
-for attr in ("get_search_results", "get_episodes", "get_video", "get_info"):
-    fn = getattr(prov, attr, None)
-    if fn:
-        try:
-            print(attr, inspect.signature(fn))
-        except Exception:
-            pass
-
-results = show("search blue box", lambda: list(prov.get_search_results("blue box"))[:3])
-if not results:
-    raise SystemExit(1)
-
-r0 = results[0]
-print("\nfirst result:", r0)
-ident = getattr(r0, "identifier", None) or (r0.get("identifier") if isinstance(r0, dict) else None)
-print("identifier:", ident)
-
-from anipy_api.provider import LanguageTypeEnum
-
-eps = show("episodes sub", lambda: list(prov.get_episodes(ident, LanguageTypeEnum.SUB))[:5])
-print("episodes:", eps)
-
-if eps:
-    ep = eps[1] if len(eps) > 1 else eps[0]
-    stream = show("get_video", lambda: prov.get_video(ident, ep, LanguageTypeEnum.SUB))
-    if stream:
-        print("\nSTREAM URL:", getattr(stream, "url", stream))
-        for attr in ("referrer", "referer", "headers", "resolution"):
-            print(attr, getattr(stream, attr, None))
+print("\n=== try instantiate + search ===")
+for cls in list_providers():
+    name = cls.__name__
+    print("\n---", name)
+    try:
+        p = cls()
+    except Exception as exc:
+        print("instantiate fail:", type(exc).__name__, exc)
+        continue
+    try:
+        res = list(p.get_search_results("blue box"))[:2]
+        print("search ok:", res)
+        if not res:
+            continue
+        ident = getattr(res[0], "identifier", None)
+        print("identifier:", ident)
+        eps = list(p.get_episodes(ident, LanguageTypeEnum.SUB))[:3]
+        print("episodes:", eps)
+        if eps:
+            st = p.get_video(ident, eps[1] if len(eps) > 1 else eps[0], LanguageTypeEnum.SUB)
+            print("STREAM:", getattr(st, "url", st))
+            print("referrer:", getattr(st, "referrer", None))
+            print("resolution:", getattr(st, "resolution", None))
+            break
+    except Exception as exc:
+        print("fail:", type(exc).__name__, exc)
+        traceback.print_exc(limit=2)
