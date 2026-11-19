@@ -1,19 +1,14 @@
 """
-AllAnime provider for the anime-bot.
+AllAnime / MKissa provider.
 
-Talks to the public AllAnime GraphQL API, which is NOT behind Cloudflare and
-therefore works from datacenter IPs (GitHub Actions). Search needs no signing;
-resolving episode sources needs the "aaReq" AES-GCM extension, implemented here.
+Crypto comes from the auto-updated keygen JSON, so nothing is scraped from the
+site and no browser is needed. Search is unsigned; episode sources are signed.
 
-Public API:
-    search(query)                     -> list of dicts
-    episodes(show_id, kind)           -> list of ints
-    resolve(show_id, episode, kind)   -> (mp4_url, referer)
-    health()                          -> dict for /debug
-    probe(show_id, episode, kind)     -> diagnostics dict
+    search(query)          -> [{id, name, sub, dub}]
+    episodes(show_id, kind)-> [1, 2, 3, ...]
+    resolve(show_id, ep, kind) -> (url, referer, resolution)
 
-CLI:
-    python allanime.py "blue box" 2 sub
+CLI: python allanime.py "blue box" 2 sub
 """
 
 import base64
@@ -21,277 +16,113 @@ import hashlib
 import json
 import re
 import time
+from urllib.parse import urljoin
 
 from curl_cffi import requests as creq
 
-API = "https://api.allanime.day/api"
-HOSTS = [
-    "https://mkissa.to",
-    "https://allanime.day",
-    "https://youtu-chan.com",
-    "https://allmanga.to",
-]
-ORIGIN = "https://youtu-chan.com"
-MASK = "b1a9a4d051988f1b1b12dbb747439d9bd64b09ea17835600a7eaa4de87c1ad87"
-
-EP_QH = "d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec"
-BUILD_FALLBACKS = ["9", "44", "181"]
-
+API = "https://api.mkissa.net/api"
+CDN_CLOCK = "https://allanime.day"
+KEYGEN_URL = ("https://raw.githubusercontent.com/sdaqo/anipy-cli/"
+              "refs/heads/key-gen/scripts/keygen/keygen.json")
+ORIGIN = "https://mkissa.to"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-HEADERS = {
-    "User-Agent": UA,
-    "Accept": "application/json, text/plain, */*",
-    "Origin": ORIGIN,
-    "Referer": ORIGIN + "/",
-}
+SEARCH_QH = "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c"
+SHOW_QH = "043448386c7a686bc2aabfbb6b80f6074e795d350df48015023b079527b0848a"
 
-SEARCH_QUERY = (
-    'query($search:SearchInput,$limit:Int,$page:Int)'
-    '{shows(search:$search,limit:$limit,page:$page)'
-    '{edges{_id name availableEpisodes thumbnail}}'
-    '}'
-)
+ALLOWED = ["Yt-mp4", "S-Mp4", "Uv-mp4", "Luf-Mp4", "Ak", "Default", "Mp4"]
 
-RE_EPOCH = re.compile(r'epoch["\']?\s*[:=]\s*["\']?(\d{3,})')
-RE_PARTB = re.compile(r'partB["\']?\s*[:=]\s*["\']([A-Za-z0-9+/=]{20,})["\']')
-RE_BUILD = re.compile(r'buildId["\']?\s*[:=]\s*["\']?(\d{1,4})')
-
-CIPHER = {
-    0x79: "A", 0x7A: "B", 0x7B: "C", 0x7C: "D", 0x7D: "E", 0x7E: "F", 0x7F: "G",
-    0x70: "H", 0x71: "I", 0x72: "J", 0x73: "K", 0x74: "L", 0x75: "M", 0x76: "N",
-    0x77: "O", 0x68: "P", 0x69: "Q", 0x6A: "R", 0x6B: "S", 0x6C: "T", 0x6D: "U",
-    0x6E: "V", 0x6F: "W", 0x60: "X", 0x61: "Y", 0x62: "Z", 0x59: "a", 0x5A: "b",
-    0x5B: "c", 0x5C: "d", 0x5D: "e", 0x5E: "f", 0x5F: "g", 0x50: "h", 0x51: "i",
-    0x52: "j", 0x53: "k", 0x54: "l", 0x55: "m", 0x56: "n", 0x57: "o", 0x48: "p",
-    0x49: "q", 0x4A: "r", 0x4B: "s", 0x4C: "t", 0x4D: "u", 0x4E: "v", 0x4F: "w",
-    0x40: "x", 0x41: "y", 0x42: "z", 0x08: "0", 0x09: "1", 0x0A: "2", 0x0B: "3",
-    0x0C: "4", 0x0D: "5", 0x0E: "6", 0x0F: "7", 0x00: "8", 0x01: "9", 0x02: ":",
-    0x03: "/", 0x04: ".", 0x05: "-", 0x06: "_", 0x07: "?", 0x1B: "&", 0x1C: "=",
-    0x1D: "%", 0x1E: "$", 0x1F: ",", 0x10: " ", 0x11: "(", 0x12: ")", 0x13: "[",
-    0x14: "]", 0x15: "{", 0x16: "}", 0x17: "|", 0x18: "#", 0x19: ";", 0x1A: "+",
-    0x20: "@", 0x21: "!", 0x22: "~", 0x23: "`", 0x24: "'", 0x25: '"', 0x26: "*",
-    0x27: "<", 0x28: ">", 0x29: "^",
-}
+_keygen_cache = {"at": 0.0, "data": None}
 
 
 def _sess():
     s = creq.Session(impersonate="chrome")
-    s.headers.update(HEADERS)
+    s.headers.update({
+        "User-Agent": UA,
+        "Referer": ORIGIN + "/",
+        "Origin": ORIGIN,
+        "Accept": "application/json, text/plain, */*",
+    })
     return s
 
 
-def _decipher(url):
-    if not url or not url.startswith("--"):
-        return url
-    body = url[2:]
-    out = []
-    for i in range(0, len(body) - 1, 2):
-        try:
-            out.append(CIPHER.get(int(body[i:i + 2], 16), ""))
-        except ValueError:
-            pass
-    return "".join(out)
+def _keygen(sess):
+    if _keygen_cache["data"] and time.time() - _keygen_cache["at"] < 600:
+        return _keygen_cache["data"]
+    r = sess.get(KEYGEN_URL, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    _keygen_cache.update(at=time.time(), data=data)
+    return data
 
 
-def _xor_key(part_b):
-    raw = base64.b64decode(part_b)
-    mask = bytes.fromhex(MASK)
-    return bytes(a ^ b for a, b in zip(raw, mask * 4))
-
-
-def _aes_gcm_encrypt(key, iv, plain):
+def _aareq(kg):
+    ts = int(time.time() * 1000) // 300000 * 300000
+    payload = {
+        "v": 1,
+        "ts": ts,
+        "epoch": kg["epoch"],
+        "buildId": kg["build_id"],
+        "qh": kg["query_hash"],
+        "k": kg["lane"],
+    }
+    seed = f"{kg['epoch']}:{kg['query_hash']}:{ts}"
+    iv = hashlib.sha256(seed.encode()).digest()[:12]
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    return AESGCM(key).encrypt(iv, plain, None)
+    ct = AESGCM(bytes.fromhex(kg["key"])).encrypt(
+        iv, json.dumps(payload, separators=(",", ":")).encode(), None
+    )
+    return base64.b64encode(b"\x01" + iv + ct).decode()
 
 
-def _aes_ctr_decrypt(key, iv, data):
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    c = Cipher(algorithms.AES(key), modes.CTR(iv)).decryptor()
-    return c.update(data) + c.finalize()
-
-
-def _decrypt_blob(key, blob):
-    try:
-        raw = base64.b64decode(blob)
-    except Exception:
-        return None
-    candidates = []
-    if raw[:1] == b"\x01" and len(raw) > 17:
-        candidates.append((raw[1:13], raw[13:]))
-        candidates.append((raw[1:17], raw[17:]))
-    if len(raw) > 16:
-        candidates.append((raw[:12], raw[12:]))
-        candidates.append((raw[:16], raw[16:]))
-    candidates.append((hashlib.sha256(key).digest()[:12], raw))
-    for iv, body in candidates:
-        if len(iv) not in (12, 16):
+def _decode_tobeparsed(kg, blob):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    raw = base64.b64decode(blob)
+    iv, ct, tag = raw[1:13], raw[13:-16], raw[-16:]
+    candidates = [bytes.fromhex(kg["key"])]
+    static = kg.get("static_key") or ""
+    if static:
+        candidates.append(static.encode())
+        candidates.append(hashlib.sha256(static.encode()).digest())
+    for key in candidates:
+        if len(key) not in (16, 24, 32):
             continue
         try:
-            txt = _aes_ctr_decrypt(key, iv, body).decode("utf-8", "ignore").strip()
+            plain = AESGCM(key).decrypt(iv, ct + tag, None)
+            return json.loads(plain.decode("utf-8"))
         except Exception:
             continue
-        if "sourceUrls" in txt or txt.startswith("{"):
-            return txt
+    _keygen_cache["at"] = 0.0
     return None
 
 
-def _crypto_urls(show_id, episode, kind):
-    paths = [
-        f"/watch/{show_id}/p-{episode}-{kind}",
-        f"/watch/{show_id}/p-{episode}",
-        f"/anime/{show_id}/{kind}-{episode}",
-    ]
-    for host in HOSTS:
-        for path in paths:
-            yield host + path
-
-
-def probe(show_id, episode, kind="sub"):
-    """Diagnostics: what do the episode pages actually return?"""
-    sess = _sess()
-    report = []
-    for url in _crypto_urls(show_id, episode, kind):
-        item = {"url": url}
+def _decrypt_path(value):
+    out = ""
+    for i in range(0, len(value) - 1, 2):
         try:
-            r = sess.get(url, timeout=30, allow_redirects=True)
-            html = r.text or ""
-            item["status"] = r.status_code
-            item["len"] = len(html)
-            item["final"] = str(r.url)
-            e = RE_EPOCH.search(html)
-            p = RE_PARTB.search(html)
-            item["epoch"] = e.group(1) if e else None
-            item["partB"] = (p.group(1)[:16] + "...") if p else None
-            item["has_aaCrypto"] = "__aaCrypto" in html
-            if not p:
-                item["head"] = html[:300].replace("\n", " ")
-        except Exception as exc:
-            item["error"] = f"{type(exc).__name__}: {exc}"
-        report.append(item)
-        if item.get("partB"):
-            break
-    return report
-
-
-def _page_crypto(sess, show_id, episode, kind):
-    tried = []
-    for url in _crypto_urls(show_id, episode, kind):
-        try:
-            r = sess.get(url, timeout=30)
-        except Exception as exc:
-            tried.append(f"{url} -> {type(exc).__name__}")
+            num = int(value[i:i + 2], 16) ^ 56
+        except ValueError:
             continue
-        html = r.text or ""
-        if r.status_code != 200:
-            tried.append(f"{url} -> HTTP {r.status_code}")
-            continue
-        e = RE_EPOCH.search(html)
-        p = RE_PARTB.search(html)
-        if e and p:
-            b = RE_BUILD.search(html)
-            return e.group(1), p.group(1), (b.group(1) if b else None)
-        tried.append(f"{url} -> 200 but no crypto ({len(html)}b)")
-    raise RuntimeError("__aaCrypto not found: " + "; ".join(tried[:4]))
+        out += chr(int(oct(num)[2:].zfill(3), 8))
+    return out
 
 
-def _signed_request(sess, show_id, episode, kind):
-    epoch, part_b, build = _page_crypto(sess, show_id, episode, kind)
-    key = _xor_key(part_b)
-    builds = [build] if build else []
-    builds += [b for b in BUILD_FALLBACKS if b not in builds]
-
-    last = "unknown"
-    for b in builds:
-        ts = int(time.time() // 300 * 300)
-        seed = f"{epoch}:{b}:{EP_QH}:{ts}"
-        iv = hashlib.sha256(seed.encode()).digest()[:12]
-        payload = json.dumps(
-            {"v": 1, "ts": ts, "epoch": int(epoch), "buildId": b, "qh": EP_QH},
-            separators=(",", ":"),
-        ).encode()
-        aa_req = base64.b64encode(
-            b"\x01" + iv + _aes_gcm_encrypt(key, iv, payload)
-        ).decode()
-        body = {
-            "variables": {
-                "showId": show_id,
-                "translationType": kind,
-                "episodeString": str(episode),
-            },
-            "extensions": {
-                "persistedQuery": {"version": 1, "sha256Hash": EP_QH},
-                "aaReq": aa_req,
-            },
-        }
-        hdrs = {"Content-Type": "application/json", "x-build-id": b}
-        r = sess.post(API, data=json.dumps(body), headers=hdrs, timeout=60)
-        try:
-            data = r.json()
-        except Exception:
-            last = f"HTTP {r.status_code} non-json"
-            continue
-        ep = (data.get("data") or {}).get("episode")
-        if ep:
-            return ep, key
-        err = data.get("errors") or [{}]
-        last = err[0].get("message", f"HTTP {r.status_code}")
-        if "CAPTCHA" in last.upper():
-            break
-    raise RuntimeError(f"episode query failed: {last}")
+def _post(sess, variables, qh):
+    params = {
+        "variables": json.dumps(variables),
+        "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": qh}}),
+    }
+    r = sess.post(API, params=params, timeout=45)
+    return r.json()
 
 
-def _sources(ep, key):
-    if isinstance(ep, dict) and isinstance(ep.get("sourceUrls"), list):
-        return [(s.get("sourceName", ""), s.get("sourceUrl", "")) for s in ep["sourceUrls"]]
-    blob = None
-    if isinstance(ep, dict):
-        for k in ("tobeparsed", "toBeParsed", "encrypted", "data"):
-            if isinstance(ep.get(k), str):
-                blob = ep[k]
-                break
-    if not blob:
-        return []
-    txt = _decrypt_blob(key, blob)
-    if not txt:
-        return []
-    try:
-        obj = json.loads(txt)
-    except Exception:
-        return []
-    if isinstance(obj, dict) and isinstance(obj.get("sourceUrls"), list):
-        obj = obj["sourceUrls"]
-    if not isinstance(obj, list):
-        return []
-    return [(s.get("sourceName", ""), s.get("sourceUrl", ""))
-            for s in obj if isinstance(s, dict)]
-
-
-def _clock(sess, url):
-    r = sess.get(url, timeout=60, headers={"Referer": ORIGIN + "/"})
-    try:
-        data = r.json()
-    except Exception:
-        return None
-    best = None
-    for ln in data.get("links") or []:
-        link = ln.get("link") or ""
-        if not link.startswith("http") or ".m3u8" in link:
-            continue
-        try:
-            res = int(ln.get("resolutionStr") or ln.get("resolution") or 0)
-        except (TypeError, ValueError):
-            res = 0
-        if best is None or res > best[0]:
-            best = (res, link)
-    return best[1] if best else None
-
-
-def search(query, limit=25):
+def search(query, limit=26):
     sess = _sess()
     body = {
-        "query": SEARCH_QUERY,
+        "query": ("query($search:SearchInput,$limit:Int,$page:Int)"
+                  "{shows(search:$search,limit:$limit,page:$page)"
+                  "{edges{_id name availableEpisodes thumbnail}}}"),
         "variables": {"search": {"query": query}, "limit": limit, "page": 1},
     }
     r = sess.post(API, data=json.dumps(body),
@@ -312,50 +143,96 @@ def search(query, limit=25):
 
 def episodes(show_id, kind="sub"):
     sess = _sess()
-    body = {
-        "query": SEARCH_QUERY,
-        "variables": {"search": {"query": ""}, "limit": 1, "page": 1},
-    }
-    r = sess.post(API, data=json.dumps(body),
-                  headers={"Content-Type": "application/json"}, timeout=45)
-    edges = (((r.json().get("data") or {}).get("shows") or {}).get("edges")) or []
-    if not edges:
-        return []
-    av = edges[0].get("availableEpisodes") or {}
-    return list(range(1, int(av.get(kind) or 0) + 1))
+    try:
+        data = _post(sess, {"_id": show_id}, SHOW_QH)
+        detail = (data.get("data") or {}).get("show") or {}
+        lst = ((detail.get("availableEpisodesDetail") or {}).get(kind)) or []
+        if lst:
+            return sorted(int(float(x)) for x in lst)
+    except Exception:
+        pass
+    return []
 
 
 def resolve(show_id, episode, kind="sub"):
     sess = _sess()
-    ep, key = _signed_request(sess, show_id, episode, kind)
-    srcs = _sources(ep, key)
-    if not srcs:
-        raise RuntimeError("no sourceUrls")
+    kg = _keygen(sess)
+    tt = "dub" if kind == "dub" else "sub"
+    params = {
+        "variables": json.dumps({
+            "showId": show_id,
+            "translationType": tt,
+            "episodeString": str(episode),
+        }),
+        "extensions": json.dumps({
+            "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
+            "aaReq": _aareq(kg),
+            "k": kg["lane"],
+        }),
+    }
+    r = sess.get(API, params=params, timeout=60,
+                 headers={"x-build-id": kg["build_id"]})
+    data = r.json().get("data") or {}
 
-    direct, clock = [], []
-    for _name, raw in srcs:
-        url = _decipher(raw)
-        if not url.startswith("http"):
+    if "tobeparsed" in data:
+        data = _decode_tobeparsed(kg, data["tobeparsed"]) or {}
+    if not data.get("episode"):
+        raise RuntimeError("episode payload empty")
+
+    streams = []
+    for item in data["episode"].get("sourceUrls") or []:
+        name = item.get("sourceName") or ""
+        url = item.get("sourceUrl") or ""
+        if name not in ALLOWED:
             continue
-        low = url.lower()
-        if "fast4speed" in low or low.endswith(".mp4"):
-            direct.append(url)
-        elif "clock.json" in low or "/apiv" in low:
-            clock.append(url)
 
-    for url in direct:
-        return url, ORIGIN + "/"
-    for url in clock:
-        mp4 = _clock(sess, url)
-        if mp4:
-            return mp4, ORIGIN + "/"
-    raise RuntimeError(f"no playable link among {len(srcs)} sources")
+        if "tools.fast4speed.rsvp" in url:
+            streams.append((1080, url, ORIGIN + "/"))
+            continue
+
+        if name == "Mp4":
+            try:
+                page = sess.get(url, timeout=45).text
+            except Exception:
+                continue
+            m = re.search(r'src:\s*"([^"]+)"', page)
+            if m:
+                streams.append((1080, m.group(1), "https://www.mp4upload.com"))
+            continue
+
+        path = _decrypt_path(url.replace("--", "")).replace("clock", "clock.json")
+        try:
+            raw = sess.get(CDN_CLOCK + path, timeout=45,
+                           headers={"Referer": CDN_CLOCK + "/"}).json()
+        except Exception:
+            continue
+
+        for links in raw.get("links") or []:
+            link = links.get("link") or ""
+            if "repackager.wixmp.com" in link:
+                parts = link.split(".urlset")[0].replace(
+                    "repackager.wixmp.com/", "").split(",")
+                head, tail = parts[0], parts[-1]
+                for q in parts[1:-1]:
+                    try:
+                        streams.append((int(q.replace("p", "")), head + q + tail, ORIGIN))
+                    except ValueError:
+                        pass
+                continue
+            referer = (links.get("headers") or {}).get("Referer") or ORIGIN
+            streams.append((1080, link, referer))
+
+    if not streams:
+        raise RuntimeError("no usable stream")
+    streams.sort(key=lambda s: s[0], reverse=True)
+    return streams[0]
 
 
 def health():
     try:
-        res = search("blue box", limit=3)
-        return {"ok": bool(res), "results": len(res)}
+        sess = _sess()
+        kg = _keygen(sess)
+        return {"ok": True, "build": kg.get("build_id"), "epoch": kg.get("epoch")}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -363,19 +240,18 @@ def health():
 if __name__ == "__main__":
     import sys
     q = sys.argv[1] if len(sys.argv) > 1 else "blue box"
-    ep_no = sys.argv[2] if len(sys.argv) > 2 else "2"
+    ep = sys.argv[2] if len(sys.argv) > 2 else "2"
     kind = sys.argv[3] if len(sys.argv) > 3 else "sub"
-    print("health:", json.dumps(health(), ensure_ascii=False))
+    print("health:", health())
     hits = search(q)
-    print("search:", json.dumps(hits[:2], ensure_ascii=False))
+    print("hits:", len(hits), hits[:1])
     if hits:
-        target = hits[0]
-        print("show:", target["id"], target["name"])
-        print("PROBE:")
-        for row in probe(target["id"], ep_no, kind):
-            print("  ", json.dumps(row, ensure_ascii=False)[:400])
+        h = hits[-1]
+        print("show:", h["id"], h["name"], "sub", h["sub"], "dub", h["dub"])
+        print("eps:", episodes(h["id"], kind)[:5])
         try:
-            url, ref = resolve(target["id"], ep_no, kind)
-            print("mp4:", url)
+            res, url, ref = resolve(h["id"], ep, kind)
+            print("OK", res, url)
+            print("ref:", ref)
         except Exception as exc:
-            print("resolve failed:", type(exc).__name__, exc)
+            print("FAIL", type(exc).__name__, exc)
