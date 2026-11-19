@@ -1,7 +1,6 @@
 """Fetch live MKissa crypto values (epoch, partB-derived key, build, lane, hash).
 
-Needs node + npm on the runner; the mask is extracted from the site bundle with
-the public mbpowers/ani-extract tool, exactly like upstream's keygen does.
+The mask is extracted from the site bundle with mbpowers/ani-extract (node).
 """
 
 import base64
@@ -50,14 +49,39 @@ def _tool():
 
 def _mask_from_chunk(chunk_js):
     tool = _tool()
-    chunk_path = os.path.join(tool, "chunk.js")
-    with open(chunk_path, "w", encoding="utf-8") as fh:
+    with open(os.path.join(tool, "chunk.js"), "w", encoding="utf-8") as fh:
         fh.write(chunk_js)
     res = subprocess.run(["node", "ani-extract.js", "./chunk.js"],
                          cwd=tool, capture_output=True, text=True, timeout=120)
     blocks = json.loads(res.stdout.strip().replace("'", '"'))
-    embedded = b"".join(base64.b64decode(b) for b in blocks)
-    return embedded
+    return b"".join(base64.b64decode(b) for b in blocks)
+
+
+def _build_candidates(chunk_js):
+    found = []
+    for pattern in (
+        r'!==\s*"string"\s*\?\s*"(\d{1,4})"',
+        r'typeof[^?]{0,60}\?\s*"(\d{1,4})"\s*:',
+        r'buildId[^,;{}]{0,60}?"(\d{1,4})"',
+        r'"(\d{1,4})"[^,;{}]{0,40}?buildId',
+    ):
+        for m in re.finditer(pattern, chunk_js):
+            if m.group(1) not in found:
+                found.append(m.group(1))
+    for anchor in ("x-aa-boot", "x-build-id"):
+        idx = chunk_js.find(anchor)
+        if idx == -1:
+            continue
+        window = chunk_js[max(0, idx - 600): idx + 600]
+        for m in re.finditer(r'"(\d{1,4})"', window):
+            if m.group(1) not in found:
+                found.append(m.group(1))
+    return [b for b in found if 1 <= int(b) <= 9999]
+
+
+def _lane(chunk_js):
+    m = re.search(r'"(k\d{1,3})"', chunk_js)
+    return m.group(1) if m else "k7"
 
 
 def _query_hash(chunk_js):
@@ -88,7 +112,6 @@ def _query_hash(chunk_js):
 
 
 def fetch_live():
-    """Return dict with build_id, epoch, lane, key, query_hash."""
     s = _session()
     html = s.get(MKISSA, timeout=20).text
     app_path = re.search(r"/entry/app\.[A-Za-z0-9_.-]+\.js", html)
@@ -97,54 +120,62 @@ def fetch_live():
     app_js = s.get(CDN + app_path.group(), timeout=20).text
 
     chunks = re.findall(r'"../(chunks/[A-Za-z0-9_.-]+\.js)"', app_js)[:5]
+    errors = []
     for chunk in chunks:
-        chunk_js = s.get(f"{CDN}/{chunk}", timeout=20).text
+        chunk_js = s.get(f"{CDN}/{chunk}", timeout=30).text
         if "VaildTranslationTypeEnumType" not in chunk_js and "x-aa-boot" not in chunk_js:
             continue
 
-        build = re.search(r'!=="string"\?"([0-9]+)"', chunk_js)
-        lane = re.search(r'const ..="(k[0-9]+)"', chunk_js)
-        if not build or not lane:
+        lane_id = _lane(chunk_js)
+        embedded = _mask_from_chunk(chunk_js)
+        if len(embedded) < 32:
+            errors.append(f"{chunk}: mask too short ({len(embedded)})")
             continue
-        build_id, lane_id = build.group(1), lane.group(1)
 
         now = int(time.time() * 1000)
         epoch = now // EPOCH_MS
         if now - epoch * EPOCH_MS < 86_400_000 and epoch > 0:
             epoch -= 1
 
-        embedded = _mask_from_chunk(chunk_js)
-        mask = bytes(
-            value
-            ^ (ord(build_id[i % len(build_id)]) ^ ((i * 17 + 31) & 0xFF))
-            ^ ((i // 8 * 41 + i % 8 * 7) & 0xFF)
-            for i, value in enumerate(embedded)
-        )
-        hk = hmac.digest(mask, f"aa-boot:{build_id}".encode(), "sha256")
-        aa_boot = hmac.digest(
-            hk, f"{build_id}:mkissa:mkissa.to:{epoch}:{lane_id}".encode(), "sha256"
-        ).hex()
+        for build_id in _build_candidates(chunk_js)[:6]:
+            mask = bytes(
+                value
+                ^ (ord(build_id[i % len(build_id)]) ^ ((i * 17 + 31) & 0xFF))
+                ^ ((i // 8 * 41 + i % 8 * 7) & 0xFF)
+                for i, value in enumerate(embedded)
+            )
+            hk = hmac.digest(mask, f"aa-boot:{build_id}".encode(), "sha256")
+            aa_boot = hmac.digest(
+                hk, f"{build_id}:mkissa:mkissa.to:{epoch}:{lane_id}".encode(), "sha256"
+            ).hex()
+            r = s.get(f"{API}/client-crypto/v1/bootstrap",
+                      params={"buildId": build_id, "k": lane_id},
+                      headers={
+                          "x-build-id": build_id,
+                          "x-aa-boot": aa_boot,
+                          "Referer": MKISSA,
+                          "Origin": MKISSA,
+                      }, timeout=20)
+            try:
+                boot = r.json()
+            except Exception:
+                errors.append(f"build {build_id}: non-json {r.status_code}")
+                continue
+            if "partB" not in boot:
+                errors.append(f"build {build_id}: {str(boot)[:120]}")
+                continue
 
-        boot = s.get(f"{API}/client-crypto/v1/bootstrap",
-                     params={"buildId": build_id, "k": lane_id},
-                     headers={
-                         "x-build-id": build_id,
-                         "x-aa-boot": aa_boot,
-                         "Referer": MKISSA,
-                         "Origin": MKISSA,
-                     }, timeout=20).json()
+            key = bytes(a ^ b for a, b in zip(mask, base64.b64decode(boot["partB"])))
+            return {
+                "build_id": build_id,
+                "epoch": boot.get("epoch", epoch),
+                "lane": boot.get("k", lane_id),
+                "key": key.hex(),
+                "query_hash": _query_hash(chunk_js),
+                "static_key": "Xot36i3lK3:v1",
+            }
 
-        key = bytes(a ^ b for a, b in zip(mask, base64.b64decode(boot["partB"])))
-        return {
-            "build_id": build_id,
-            "epoch": boot["epoch"],
-            "lane": boot.get("k", lane_id),
-            "key": key.hex(),
-            "query_hash": _query_hash(chunk_js),
-            "static_key": "Xot36i3lK3:v1",
-        }
-
-    raise RuntimeError("no crypto chunk found")
+    raise RuntimeError("bootstrap failed: " + "; ".join(errors[:6]))
 
 
 if __name__ == "__main__":
