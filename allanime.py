@@ -1,12 +1,12 @@
 """
 AllAnime / MKissa provider.
-Crypto comes from the auto-updated keygen JSON. No browser needed.
+Crypto base values come from an auto-updated keygen JSON; the epoch is then
+walked forward until the API accepts it (AA_CRYPTO_STALE means "behind").
 
     search(query)              -> [{id, name, sub, dub, thumb}]
-    episodes(show_id, kind)    -> [1, 2, 3, ...]
+    episodes(show_id, kind)    -> [1, 2, ...]
     resolve(show_id, ep, kind) -> (resolution, url, referer)
-    health()                   -> dict
-    debug(show_id, ep, kind)   -> raw diagnostics
+    health() / debug(...)
 
 CLI: python allanime.py "blue box" 2 sub
 """
@@ -54,7 +54,6 @@ def _keygen(sess):
 
 
 def _keys(kg):
-    """AES candidates: current key first, then legacy static key (raw and sha256)."""
     out = [bytes.fromhex(kg["key"])]
     static = (kg.get("static_key") or "").encode()
     if static:
@@ -63,14 +62,14 @@ def _keys(kg):
     return [k for k in out if len(k) in (16, 24, 32)]
 
 
-def _aareq(kg):
+def _aareq(kg, epoch, build):
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     ts = int(time.time() * 1000) // 300000 * 300000
     payload = {
-        "v": 1, "ts": ts, "epoch": kg["epoch"],
-        "buildId": kg["build_id"], "qh": kg["query_hash"], "k": kg["lane"],
+        "v": 1, "ts": ts, "epoch": epoch,
+        "buildId": str(build), "qh": kg["query_hash"], "k": kg["lane"],
     }
-    seed = f"{kg['epoch']}:{kg['query_hash']}:{ts}"
+    seed = f"{epoch}:{kg['query_hash']}:{ts}"
     iv = hashlib.sha256(seed.encode()).digest()[:12]
     ct = AESGCM(bytes.fromhex(kg["key"])).encrypt(
         iv, json.dumps(payload, separators=(",", ":")).encode(), None
@@ -142,84 +141,78 @@ def episodes(show_id, kind="sub"):
     return sorted(int(float(x)) for x in lst)
 
 
+def _fetch_episode(sess, kg, show_id, episode, kind):
+    """Try epoch/build combinations until one is accepted. Returns (data, log)."""
+    log = []
+    base_epoch = int(kg["epoch"])
+    base_build = int(kg["build_id"])
+    for de in range(0, 5):
+        for db in range(0, 3):
+            epoch, build = base_epoch + de, base_build + db
+            params = {
+                "variables": json.dumps({
+                    "showId": show_id,
+                    "translationType": "dub" if kind == "dub" else "sub",
+                    "episodeString": str(episode),
+                }),
+                "extensions": json.dumps({
+                    "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
+                    "aaReq": _aareq(kg, epoch, build),
+                    "k": kg["lane"],
+                }),
+            }
+            try:
+                r = sess.get(API, params=params, timeout=45, headers={
+                    "x-build-id": str(build), "Referer": ORIGIN, "Origin": ORIGIN,
+                })
+                payload = r.json()
+            except Exception as exc:
+                log.append(f"{epoch}/{build} net:{type(exc).__name__}")
+                continue
+            data = payload.get("data") or {}
+            if "tobeparsed" in data or data.get("episode"):
+                log.append(f"{epoch}/{build} OK")
+                return data, log
+            msgs = [str(e.get("message")) for e in payload.get("errors") or []]
+            log.append(f"{epoch}/{build} {msgs[:1]}")
+            if not any("STALE" in m for m in msgs):
+                break
+    return None, log
+
+
 def debug(show_id, episode, kind="sub"):
     sess = _sess()
     kg = _keygen(sess)
-    out = {"build": kg.get("build_id"), "lane": kg.get("lane")}
-    body = {
-        "variables": json.dumps({"_id": show_id}),
-        "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": SHOW_QH}}),
-    }
-    r = sess.post(API, data=json.dumps(body),
-                  headers={"Content-Type": "application/json"}, timeout=45)
-    out["show_status"] = r.status_code
-    out["show_body"] = r.text[:300]
-
-    params = {
-        "variables": json.dumps({
-            "showId": show_id,
-            "translationType": "dub" if kind == "dub" else "sub",
-            "episodeString": str(episode),
-        }),
-        "extensions": json.dumps({
-            "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
-            "aaReq": _aareq(kg),
-            "k": kg["lane"],
-        }),
-    }
-    r = sess.get(API, params=params, timeout=60, headers={
-        "x-build-id": kg["build_id"], "Referer": ORIGIN, "Origin": ORIGIN,
-    })
-    out["ep_status"] = r.status_code
-    try:
-        payload = r.json()
-    except Exception:
-        out["ep_body"] = r.text[:300]
+    data, log = _fetch_episode(sess, kg, show_id, episode, kind)
+    out = {"attempts": log[:12]}
+    if data is None:
         return out
-    data = payload.get("data") or {}
-    out["errors"] = payload.get("errors")
-    out["has_tobeparsed"] = "tobeparsed" in data
     if "tobeparsed" in data:
-        out["blob_len"] = len(data["tobeparsed"])
         dec, err = _decode_tobeparsed(kg, data["tobeparsed"])
         out["decode_error"] = err
         if dec:
-            out["decoded_keys"] = list(dec.keys())
-            ep = dec.get("episode") or {}
-            srcs = ep.get("sourceUrls") or []
-            out["sources"] = [s.get("sourceName") for s in srcs][:10]
+            out["sources"] = [s.get("sourceName") for s in
+                              (dec.get("episode") or {}).get("sourceUrls") or []][:12]
+    else:
+        out["sources"] = [s.get("sourceName") for s in
+                          (data.get("episode") or {}).get("sourceUrls") or []][:12]
     return out
 
 
 def resolve(show_id, episode, kind="sub"):
     sess = _sess()
     kg = _keygen(sess)
-    params = {
-        "variables": json.dumps({
-            "showId": show_id,
-            "translationType": "dub" if kind == "dub" else "sub",
-            "episodeString": str(episode),
-        }),
-        "extensions": json.dumps({
-            "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
-            "aaReq": _aareq(kg),
-            "k": kg["lane"],
-        }),
-    }
-    r = sess.get(API, params=params, timeout=60, headers={
-        "x-build-id": kg["build_id"], "Referer": ORIGIN, "Origin": ORIGIN,
-    })
-    payload = r.json()
-    data = payload.get("data") or {}
+    data, log = _fetch_episode(sess, kg, show_id, episode, kind)
+    if data is None:
+        raise RuntimeError("no accepted epoch: " + " | ".join(log[:5]))
+
     if "tobeparsed" in data:
         data, err = _decode_tobeparsed(kg, data["tobeparsed"])
         if data is None:
             raise RuntimeError(f"decode failed: {err}")
-    if not data.get("episode"):
-        raise RuntimeError(f"no episode in payload: {str(payload)[:200]}")
 
     streams = []
-    for item in data["episode"].get("sourceUrls") or []:
+    for item in (data.get("episode") or {}).get("sourceUrls") or []:
         name = item.get("sourceName") or ""
         url = item.get("sourceUrl") or ""
         if name not in ALLOWED:
@@ -270,7 +263,7 @@ def resolve(show_id, episode, kind="sub"):
 def health():
     try:
         kg = _keygen(_sess())
-        return {"ok": True, "build": kg.get("build_id")}
+        return {"ok": True, "build": kg.get("build_id"), "epoch": kg.get("epoch")}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -286,8 +279,7 @@ if __name__ == "__main__":
     if hits:
         h = hits[-1]
         print("show:", h["id"], h["name"])
-        print("eps:", episodes(h["id"], kind)[:6])
-        print("debug:", json.dumps(debug(h["id"], ep, kind), ensure_ascii=False)[:900])
+        print("debug:", json.dumps(debug(h["id"], ep, kind), ensure_ascii=False)[:700])
         try:
             res, url, ref = resolve(h["id"], ep, kind)
             print("OK", res, url)
