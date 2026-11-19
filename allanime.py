@@ -1,7 +1,9 @@
 """
 AllAnime / MKissa provider.
-Crypto base values come from an auto-updated keygen JSON; the epoch is then
-walked forward until the API accepts it (AA_CRYPTO_STALE means "behind").
+
+Crypto base values come from an auto-updated keygen JSON; the epoch is walked
+forward until the API stops answering AA_CRYPTO_STALE. The working epoch is
+remembered on disk so later runs start from it.
 
     search(query)              -> [{id, name, sub, dub, thumb}]
     episodes(show_id, kind)    -> [1, 2, ...]
@@ -14,6 +16,7 @@ CLI: python allanime.py "blue box" 2 sub
 import base64
 import hashlib
 import json
+import os
 import re
 import time
 
@@ -29,6 +32,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 SHOW_QH = "043448386c7a686bc2aabfbb6b80f6074e795d350df48015023b079527b0848a"
 ALLOWED = {"Yt-mp4", "S-Mp4", "Uv-mp4", "Luf-Mp4", "Ak", "Default", "Mp4"}
+HINT_FILE = os.path.join("data", "allanime_epoch.json")
 
 _keygen_cache = {"at": 0.0, "data": None}
 
@@ -51,6 +55,23 @@ def _keygen(sess):
     data = r.json()
     _keygen_cache.update(at=time.time(), data=data)
     return data
+
+
+def _read_hint():
+    try:
+        with open(HINT_FILE, "r", encoding="utf-8") as fh:
+            return int(json.load(fh).get("epoch") or 0)
+    except Exception:
+        return 0
+
+
+def _write_hint(epoch):
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(HINT_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"epoch": epoch, "at": int(time.time())}, fh)
+    except Exception:
+        pass
 
 
 def _keys(kg):
@@ -141,42 +162,56 @@ def episodes(show_id, kind="sub"):
     return sorted(int(float(x)) for x in lst)
 
 
+def _one(sess, kg, show_id, episode, kind, epoch, build):
+    params = {
+        "variables": json.dumps({
+            "showId": show_id,
+            "translationType": "dub" if kind == "dub" else "sub",
+            "episodeString": str(episode),
+        }),
+        "extensions": json.dumps({
+            "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
+            "aaReq": _aareq(kg, epoch, build),
+            "k": kg["lane"],
+        }),
+    }
+    r = sess.get(API, params=params, timeout=45, headers={
+        "x-build-id": str(build), "Referer": ORIGIN, "Origin": ORIGIN,
+    })
+    return r.json()
+
+
 def _fetch_episode(sess, kg, show_id, episode, kind):
-    """Try epoch/build combinations until one is accepted. Returns (data, log)."""
+    """Walk the epoch forward until accepted. Returns (data, log)."""
     log = []
-    base_epoch = int(kg["epoch"])
-    base_build = int(kg["build_id"])
-    for de in range(0, 5):
-        for db in range(0, 3):
-            epoch, build = base_epoch + de, base_build + db
-            params = {
-                "variables": json.dumps({
-                    "showId": show_id,
-                    "translationType": "dub" if kind == "dub" else "sub",
-                    "episodeString": str(episode),
-                }),
-                "extensions": json.dumps({
-                    "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
-                    "aaReq": _aareq(kg, epoch, build),
-                    "k": kg["lane"],
-                }),
-            }
+    base_epoch = max(int(kg["epoch"]), _read_hint())
+    build = int(kg["build_id"])
+
+    for step in range(0, 8):
+        epoch = base_epoch + step
+        for _try in range(4):
             try:
-                r = sess.get(API, params=params, timeout=45, headers={
-                    "x-build-id": str(build), "Referer": ORIGIN, "Origin": ORIGIN,
-                })
-                payload = r.json()
+                payload = _one(sess, kg, show_id, episode, kind, epoch, build)
             except Exception as exc:
-                log.append(f"{epoch}/{build} net:{type(exc).__name__}")
+                log.append(f"{epoch} net:{type(exc).__name__}")
+                time.sleep(2)
                 continue
+
             data = payload.get("data") or {}
             if "tobeparsed" in data or data.get("episode"):
-                log.append(f"{epoch}/{build} OK")
+                _write_hint(epoch)
+                log.append(f"{epoch} OK")
                 return data, log
+
             msgs = [str(e.get("message")) for e in payload.get("errors") or []]
-            log.append(f"{epoch}/{build} {msgs[:1]}")
-            if not any("STALE" in m for m in msgs):
-                break
+            first = msgs[0] if msgs else "empty response"
+            if first.startswith("Too many requests"):
+                wait = re.findall(r"\d+", first)
+                time.sleep((int(wait[0]) if wait else 5) + 2)
+                continue
+            log.append(f"{epoch} {first}")
+            time.sleep(2)
+            break
     return None, log
 
 
@@ -184,7 +219,7 @@ def debug(show_id, episode, kind="sub"):
     sess = _sess()
     kg = _keygen(sess)
     data, log = _fetch_episode(sess, kg, show_id, episode, kind)
-    out = {"attempts": log[:12]}
+    out = {"hint": _read_hint(), "attempts": log[:12]}
     if data is None:
         return out
     if "tobeparsed" in data:
@@ -204,7 +239,7 @@ def resolve(show_id, episode, kind="sub"):
     kg = _keygen(sess)
     data, log = _fetch_episode(sess, kg, show_id, episode, kind)
     if data is None:
-        raise RuntimeError("no accepted epoch: " + " | ".join(log[:5]))
+        raise RuntimeError("no accepted epoch: " + " | ".join(log[:6]))
 
     if "tobeparsed" in data:
         data, err = _decode_tobeparsed(kg, data["tobeparsed"])
