@@ -48,11 +48,20 @@ def _sess():
 
 
 def _keygen(sess):
-    if _keygen_cache["data"] and time.time() - _keygen_cache["at"] < 600:
+    if _keygen_cache["data"] and time.time() - _keygen_cache["at"] < 900:
         return _keygen_cache["data"]
-    r = sess.get(KEYGEN_URL, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    data = None
+    try:
+        import keygen_live
+        data = keygen_live.fetch_live()
+        if not data.get("query_hash"):
+            data = None
+    except Exception:
+        data = None
+    if data is None:
+        r = sess.get(KEYGEN_URL, timeout=30)
+        r.raise_for_status()
+        data = r.json()
     _keygen_cache.update(at=time.time(), data=data)
     return data
 
