@@ -1,12 +1,12 @@
 """
 AllAnime / MKissa provider.
+Crypto comes from the auto-updated keygen JSON. No browser needed.
 
-Crypto comes from the auto-updated keygen JSON, so nothing is scraped from the
-site and no browser is needed. Search is unsigned; episode sources are signed.
-
-    search(query)          -> [{id, name, sub, dub}]
-    episodes(show_id, kind)-> [1, 2, 3, ...]
-    resolve(show_id, ep, kind) -> (url, referer, resolution)
+    search(query)              -> [{id, name, sub, dub, thumb}]
+    episodes(show_id, kind)    -> [1, 2, 3, ...]
+    resolve(show_id, ep, kind) -> (resolution, url, referer)
+    health()                   -> dict
+    debug(show_id, ep, kind)   -> raw diagnostics
 
 CLI: python allanime.py "blue box" 2 sub
 """
@@ -16,7 +16,6 @@ import hashlib
 import json
 import re
 import time
-from urllib.parse import urljoin
 
 from curl_cffi import requests as creq
 
@@ -28,10 +27,8 @@ ORIGIN = "https://mkissa.to"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-SEARCH_QH = "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c"
 SHOW_QH = "043448386c7a686bc2aabfbb6b80f6074e795d350df48015023b079527b0848a"
-
-ALLOWED = ["Yt-mp4", "S-Mp4", "Uv-mp4", "Luf-Mp4", "Ak", "Default", "Mp4"]
+ALLOWED = {"Yt-mp4", "S-Mp4", "Uv-mp4", "Luf-Mp4", "Ak", "Default", "Mp4"}
 
 _keygen_cache = {"at": 0.0, "data": None}
 
@@ -40,9 +37,8 @@ def _sess():
     s = creq.Session(impersonate="chrome")
     s.headers.update({
         "User-Agent": UA,
-        "Referer": ORIGIN + "/",
-        "Origin": ORIGIN,
         "Accept": "application/json, text/plain, */*",
+        "Referer": "https://allmanga.to/",
     })
     return s
 
@@ -57,19 +53,25 @@ def _keygen(sess):
     return data
 
 
+def _keys(kg):
+    """AES candidates: current key first, then legacy static key (raw and sha256)."""
+    out = [bytes.fromhex(kg["key"])]
+    static = (kg.get("static_key") or "").encode()
+    if static:
+        out.append(static)
+        out.append(hashlib.sha256(static).digest())
+    return [k for k in out if len(k) in (16, 24, 32)]
+
+
 def _aareq(kg):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     ts = int(time.time() * 1000) // 300000 * 300000
     payload = {
-        "v": 1,
-        "ts": ts,
-        "epoch": kg["epoch"],
-        "buildId": kg["build_id"],
-        "qh": kg["query_hash"],
-        "k": kg["lane"],
+        "v": 1, "ts": ts, "epoch": kg["epoch"],
+        "buildId": kg["build_id"], "qh": kg["query_hash"], "k": kg["lane"],
     }
     seed = f"{kg['epoch']}:{kg['query_hash']}:{ts}"
     iv = hashlib.sha256(seed.encode()).digest()[:12]
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     ct = AESGCM(bytes.fromhex(kg["key"])).encrypt(
         iv, json.dumps(payload, separators=(",", ":")).encode(), None
     )
@@ -79,22 +81,17 @@ def _aareq(kg):
 def _decode_tobeparsed(kg, blob):
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     raw = base64.b64decode(blob)
-    iv, ct, tag = raw[1:13], raw[13:-16], raw[-16:]
-    candidates = [bytes.fromhex(kg["key"])]
-    static = kg.get("static_key") or ""
-    if static:
-        candidates.append(static.encode())
-        candidates.append(hashlib.sha256(static.encode()).digest())
-    for key in candidates:
-        if len(key) not in (16, 24, 32):
-            continue
+    if len(raw) < 30:
+        return None, "blob too short"
+    iv, body, tag = raw[1:13], raw[13:-16], raw[-16:]
+    for key in _keys(kg):
         try:
-            plain = AESGCM(key).decrypt(iv, ct + tag, None)
-            return json.loads(plain.decode("utf-8"))
+            plain = AESGCM(key).decrypt(iv, body + tag, None)
+            return json.loads(plain.decode("utf-8")), None
         except Exception:
             continue
     _keygen_cache["at"] = 0.0
-    return None
+    return None, "all keys failed"
 
 
 def _decrypt_path(value):
@@ -106,15 +103,6 @@ def _decrypt_path(value):
             continue
         out += chr(int(oct(num)[2:].zfill(3), 8))
     return out
-
-
-def _post(sess, variables, qh):
-    params = {
-        "variables": json.dumps(variables),
-        "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": qh}}),
-    }
-    r = sess.post(API, params=params, timeout=45)
-    return r.json()
 
 
 def search(query, limit=26):
@@ -143,25 +131,34 @@ def search(query, limit=26):
 
 def episodes(show_id, kind="sub"):
     sess = _sess()
-    try:
-        data = _post(sess, {"_id": show_id}, SHOW_QH)
-        detail = (data.get("data") or {}).get("show") or {}
-        lst = ((detail.get("availableEpisodesDetail") or {}).get(kind)) or []
-        if lst:
-            return sorted(int(float(x)) for x in lst)
-    except Exception:
-        pass
-    return []
+    body = {
+        "variables": json.dumps({"_id": show_id}),
+        "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": SHOW_QH}}),
+    }
+    r = sess.post(API, data=json.dumps(body),
+                  headers={"Content-Type": "application/json"}, timeout=45)
+    detail = ((r.json().get("data") or {}).get("show") or {})
+    lst = ((detail.get("availableEpisodesDetail") or {}).get(kind)) or []
+    return sorted(int(float(x)) for x in lst)
 
 
-def resolve(show_id, episode, kind="sub"):
+def debug(show_id, episode, kind="sub"):
     sess = _sess()
     kg = _keygen(sess)
-    tt = "dub" if kind == "dub" else "sub"
+    out = {"build": kg.get("build_id"), "lane": kg.get("lane")}
+    body = {
+        "variables": json.dumps({"_id": show_id}),
+        "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": SHOW_QH}}),
+    }
+    r = sess.post(API, data=json.dumps(body),
+                  headers={"Content-Type": "application/json"}, timeout=45)
+    out["show_status"] = r.status_code
+    out["show_body"] = r.text[:300]
+
     params = {
         "variables": json.dumps({
             "showId": show_id,
-            "translationType": tt,
+            "translationType": "dub" if kind == "dub" else "sub",
             "episodeString": str(episode),
         }),
         "extensions": json.dumps({
@@ -170,14 +167,56 @@ def resolve(show_id, episode, kind="sub"):
             "k": kg["lane"],
         }),
     }
-    r = sess.get(API, params=params, timeout=60,
-                 headers={"x-build-id": kg["build_id"]})
-    data = r.json().get("data") or {}
-
+    r = sess.get(API, params=params, timeout=60, headers={
+        "x-build-id": kg["build_id"], "Referer": ORIGIN, "Origin": ORIGIN,
+    })
+    out["ep_status"] = r.status_code
+    try:
+        payload = r.json()
+    except Exception:
+        out["ep_body"] = r.text[:300]
+        return out
+    data = payload.get("data") or {}
+    out["errors"] = payload.get("errors")
+    out["has_tobeparsed"] = "tobeparsed" in data
     if "tobeparsed" in data:
-        data = _decode_tobeparsed(kg, data["tobeparsed"]) or {}
+        out["blob_len"] = len(data["tobeparsed"])
+        dec, err = _decode_tobeparsed(kg, data["tobeparsed"])
+        out["decode_error"] = err
+        if dec:
+            out["decoded_keys"] = list(dec.keys())
+            ep = dec.get("episode") or {}
+            srcs = ep.get("sourceUrls") or []
+            out["sources"] = [s.get("sourceName") for s in srcs][:10]
+    return out
+
+
+def resolve(show_id, episode, kind="sub"):
+    sess = _sess()
+    kg = _keygen(sess)
+    params = {
+        "variables": json.dumps({
+            "showId": show_id,
+            "translationType": "dub" if kind == "dub" else "sub",
+            "episodeString": str(episode),
+        }),
+        "extensions": json.dumps({
+            "persistedQuery": {"version": 1, "sha256Hash": kg["query_hash"]},
+            "aaReq": _aareq(kg),
+            "k": kg["lane"],
+        }),
+    }
+    r = sess.get(API, params=params, timeout=60, headers={
+        "x-build-id": kg["build_id"], "Referer": ORIGIN, "Origin": ORIGIN,
+    })
+    payload = r.json()
+    data = payload.get("data") or {}
+    if "tobeparsed" in data:
+        data, err = _decode_tobeparsed(kg, data["tobeparsed"])
+        if data is None:
+            raise RuntimeError(f"decode failed: {err}")
     if not data.get("episode"):
-        raise RuntimeError("episode payload empty")
+        raise RuntimeError(f"no episode in payload: {str(payload)[:200]}")
 
     streams = []
     for item in data["episode"].get("sourceUrls") or []:
@@ -230,9 +269,8 @@ def resolve(show_id, episode, kind="sub"):
 
 def health():
     try:
-        sess = _sess()
-        kg = _keygen(sess)
-        return {"ok": True, "build": kg.get("build_id"), "epoch": kg.get("epoch")}
+        kg = _keygen(_sess())
+        return {"ok": True, "build": kg.get("build_id")}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -244,11 +282,12 @@ if __name__ == "__main__":
     kind = sys.argv[3] if len(sys.argv) > 3 else "sub"
     print("health:", health())
     hits = search(q)
-    print("hits:", len(hits), hits[:1])
+    print("hits:", len(hits))
     if hits:
         h = hits[-1]
-        print("show:", h["id"], h["name"], "sub", h["sub"], "dub", h["dub"])
-        print("eps:", episodes(h["id"], kind)[:5])
+        print("show:", h["id"], h["name"])
+        print("eps:", episodes(h["id"], kind)[:6])
+        print("debug:", json.dumps(debug(h["id"], ep, kind), ensure_ascii=False)[:900])
         try:
             res, url, ref = resolve(h["id"], ep, kind)
             print("OK", res, url)
